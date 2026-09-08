@@ -18,7 +18,14 @@ import pytest
 import hermes_lcm.periodic_backup as periodic
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.engine import LCMEngine
-from hermes_lcm.externalize import load_externalized_payload
+from hermes_lcm.externalize import externalize_ingest_payload, load_externalized_payload
+from hermes_lcm.ingest_protection import (
+    extract_all_externalized_payload_refs,
+    extract_ingest_externalized_refs,
+    is_externalized_ingest_placeholder,
+    protect_messages_for_ingest,
+    restore_ingest_payload_placeholders,
+)
 
 
 UTC = timezone.utc
@@ -204,7 +211,13 @@ def test_conflicting_same_db_registration_fails_closed(tmp_path):
 def test_bundle_roundtrip_uses_exact_refs_and_existing_loader(tmp_path):
     payload_root = tmp_path / "payloads"
     _payload(payload_root / "content.json", "content payload")
-    _payload(payload_root / "ingest.json", "ingest payload", kind="raw_content")
+    _payload(
+        payload_root / "ingest.json",
+        "ingest payload",
+        kind="ingest_payload",
+        role="user",
+        field_path="content",
+    )
     _payload(payload_root / "tool-call.json", "nested tool-call payload")
     engine = _engine(tmp_path, payload_root=payload_root)
     try:
@@ -226,7 +239,7 @@ def test_bundle_roundtrip_uses_exact_refs_and_existing_loader(tmp_path):
             engine,
             role="user",
             content=(
-                "[Externalized LCM ingest payload: kind=raw_content; field=content; "
+                "[Externalized LCM ingest payload: kind=ingest_payload; field=content; "
                 "chars=14; bytes=14; ref=ingest.json]"
             ),
         )
@@ -238,6 +251,11 @@ def test_bundle_roundtrip_uses_exact_refs_and_existing_loader(tmp_path):
         assert hashlib.sha256(spec.source_db.read_bytes()).hexdigest() == source_before
 
         generation = Path(result["generation"])
+        assert {child.name for child in generation.iterdir()} == {
+            "lcm.sqlite3",
+            "manifest.json",
+            "payloads",
+        }
         manifest = json.loads((generation / "manifest.json").read_text(encoding="utf-8"))
         assert manifest["schema"] == periodic.BUNDLE_SCHEMA
         assert manifest["source_identity"]["sha256"] == spec.source_identity
@@ -252,7 +270,7 @@ def test_bundle_roundtrip_uses_exact_refs_and_existing_loader(tmp_path):
         with sqlite3.connect(restore / "lcm.sqlite3") as conn:
             assert conn.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
             stored = conn.execute("SELECT content FROM messages ORDER BY store_id LIMIT 1").fetchone()[0]
-        ref = periodic.extract_all_externalized_payload_refs(stored)[0]
+        ref = extract_all_externalized_payload_refs(stored)[0]
         loaded = load_externalized_payload(
             ref,
             config=SimpleNamespace(
@@ -261,6 +279,188 @@ def test_bundle_roundtrip_uses_exact_refs_and_existing_loader(tmp_path):
         )
         assert loaded is not None
         assert loaded["content"] == "content payload"
+    finally:
+        engine.shutdown()
+
+
+def test_production_inline_ingest_ref_survives_disposable_bundle_recovery(tmp_path):
+    engine = _engine(tmp_path)
+    try:
+        original = "before data:image/png;base64," + "AbCdEfGh01234567" * 32 + " after"
+        protected = protect_messages_for_ingest(
+            [{"role": "user", "content": original}],
+            config=engine._config,
+            hermes_home=engine._hermes_home,
+            session_id="session",
+        )[0]["content"]
+        refs = extract_ingest_externalized_refs(protected)
+        assert len(refs) == 1
+        assert restore_ingest_payload_placeholders(
+            protected,
+            config=engine._config,
+            hermes_home=engine._hermes_home,
+            session_id="session",
+        ) == original
+        _append(engine, role="user", content=protected)
+
+        result = periodic.run_periodic_backup(
+            periodic.build_periodic_backup_spec(engine), due_only=False
+        )
+        assert result["status"] == "ok"
+        assert result["payload_count"] == 1
+        restored = tmp_path / "disposable-restore"
+        shutil.copytree(Path(result["generation"]), restored)
+        restored_config = SimpleNamespace(
+            large_output_externalization_path=str(restored / "payloads")
+        )
+        assert restore_ingest_payload_placeholders(
+            protected,
+            config=restored_config,
+            session_id="session",
+        ) == original
+    finally:
+        engine.shutdown()
+
+
+def test_production_nested_tool_call_ref_survives_disposable_recovery(tmp_path):
+    engine = _engine(tmp_path)
+    try:
+        original = "data:image/png;base64," + "QrStUvWx01234567" * 32
+        protected = protect_messages_for_ingest(
+            [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call-image",
+                            "type": "function",
+                            "function": {
+                                "name": "inspect",
+                                "arguments": json.dumps(
+                                    {"payload": f"before {original} after"}
+                                ),
+                            },
+                        }
+                    ],
+                }
+            ],
+            config=engine._config,
+            hermes_home=engine._hermes_home,
+            session_id="session",
+        )[0]
+        serialized = json.dumps(protected["tool_calls"])
+        refs = extract_ingest_externalized_refs(serialized)
+        assert len(refs) == 1
+        _append(
+            engine,
+            role="assistant",
+            content="",
+            tool_calls=protected["tool_calls"],
+        )
+
+        result = periodic.run_periodic_backup(
+            periodic.build_periodic_backup_spec(engine), due_only=False
+        )
+        assert result["status"] == "ok", result
+        assert result["payload_count"] == 1
+        restored = tmp_path / "disposable-tool-call-restore"
+        shutil.copytree(Path(result["generation"]), restored)
+        restored_config = SimpleNamespace(
+            large_output_externalization_path=str(restored / "payloads")
+        )
+        marker_match = periodic._INGEST_MARKER_RE.search(serialized)
+        assert marker_match is not None
+        restored_marker = restore_ingest_payload_placeholders(
+            marker_match.group(0),
+            config=restored_config,
+            session_id="session",
+        )
+        assert restored_marker == original
+    finally:
+        engine.shutdown()
+
+
+def test_invalid_genuine_ref_is_not_silently_omitted(tmp_path):
+    engine = _engine(tmp_path)
+    try:
+        marker = (
+            "[Externalized LCM ingest payload: kind=ingest_payload; field=content; "
+            "chars=4; bytes=4; ref=../outside.json]"
+        )
+        assert is_externalized_ingest_placeholder(marker)
+        _append(engine, role="user", content=marker)
+        result = periodic.run_periodic_backup(
+            periodic.build_periodic_backup_spec(engine), due_only=False
+        )
+        assert result["status"] == "failed"
+        assert "invalid externalized payload reference" in result["error"]
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_error"),
+    [
+        ({"session_id": "wrong-session"}, "session identity"),
+        ({"kind": "wrong-kind"}, "kind"),
+        ({"field_path": "tool_calls[0]"}, "field"),
+        ({"content": {"not": "text"}}, "content"),
+    ],
+)
+def test_ingest_payload_schema_and_context_mismatch_is_rejected(
+    tmp_path, mutation, expected_error
+):
+    engine = _engine(tmp_path)
+    try:
+        created = externalize_ingest_payload(
+            "recover this",
+            role="user",
+            session_id="session",
+            field_path="content",
+            config=engine._config,
+            hermes_home=engine._hermes_home,
+        )
+        assert created is not None
+        _append(engine, role="user", content=created["placeholder"])
+        payload = json.loads(created["path"].read_text(encoding="utf-8"))
+        payload.update(mutation)
+        created["path"].write_text(json.dumps(payload), encoding="utf-8")
+
+        result = periodic.run_periodic_backup(
+            periodic.build_periodic_backup_spec(engine), due_only=False
+        )
+        assert result["status"] == "failed"
+        assert expected_error in result["error"]
+    finally:
+        engine.shutdown()
+
+
+def test_reverification_checks_db_reference_completeness(tmp_path):
+    engine = _engine(tmp_path)
+    try:
+        created = externalize_ingest_payload(
+            "recover this",
+            role="user",
+            session_id="session",
+            field_path="content",
+            config=engine._config,
+            hermes_home=engine._hermes_home,
+        )
+        assert created is not None
+        _append(engine, role="user", content=created["placeholder"])
+        spec = periodic.build_periodic_backup_spec(engine)
+        result = periodic.run_periodic_backup(spec, due_only=False)
+        assert result["status"] == "ok"
+        generation = Path(result["generation"])
+        manifest = json.loads((generation / "manifest.json").read_text(encoding="utf-8"))
+        assert len(manifest["payloads"]) == 1
+        (generation / "payloads" / manifest["payloads"][0]["basename"]).unlink()
+        manifest["payloads"] = []
+        (generation / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+        with pytest.raises(periodic.PeriodicBackupError):
+            periodic._read_verified_pointer(spec)
     finally:
         engine.shutdown()
 
@@ -507,6 +707,87 @@ def test_due_restart_and_wall_clock_jumps(monkeypatch, tmp_path):
         engine.shutdown()
 
 
+@pytest.mark.parametrize(
+    "wall_delta",
+    [timedelta(days=-1), timedelta(days=1)],
+    ids=["backward", "forward"],
+)
+def test_wall_clock_jump_during_worker_keeps_monotonic_interval(
+    tmp_path, monkeypatch, wall_delta
+):
+    engine = _engine(tmp_path, interval_hours=0.00005)
+    real_run = periodic.run_periodic_backup
+    wall = [datetime.now(UTC)]
+    statuses: list[str] = []
+    first = threading.Event()
+
+    def observe(*args, **kwargs):
+        result = real_run(*args, **kwargs)
+        statuses.append(result["status"])
+        if result["status"] == "ok" and not first.is_set():
+            wall[0] += wall_delta
+            first.set()
+        return result
+
+    monkeypatch.setattr(periodic, "_utc_now", lambda: wall[0])
+    monkeypatch.setattr(periodic, "run_periodic_backup", observe)
+    scheduler = periodic._Scheduler(periodic.build_periodic_backup_spec(engine))
+    try:
+        assert first.wait(3)
+        _wait_for(lambda: statuses.count("ok") >= 2, timeout=3)
+    finally:
+        assert scheduler.stop()
+        engine.shutdown()
+
+
+def test_scheduler_rechecks_due_after_other_process_publishes(tmp_path, monkeypatch):
+    engine = _engine(tmp_path)
+    spec = periodic.build_periodic_backup_spec(engine)
+    context = multiprocessing.get_context("fork")
+    acquired = context.Event()
+    release = context.Event()
+    queue = context.Queue()
+    deferred = threading.Event()
+    second_done = threading.Event()
+    child = context.Process(
+        target=_run_holding_backup,
+        args=(spec, acquired, release, queue),
+    )
+    child.start()
+    assert acquired.wait(5)
+    statuses: list[str] = []
+    due_flags: list[bool] = []
+    real_run = periodic.run_periodic_backup
+
+    def observe(*args, **kwargs):
+        result = real_run(*args, **kwargs)
+        statuses.append(result["status"])
+        due_flags.append(kwargs.get("due_only", True))
+        if result["status"] == "deferred_busy":
+            deferred.set()
+        elif deferred.is_set():
+            second_done.set()
+        return result
+
+    monkeypatch.setattr(periodic, "run_periodic_backup", observe)
+    monkeypatch.setattr(periodic, "_MAX_FAILURE_BACKOFF_SECONDS", 0.05)
+    scheduler = periodic._Scheduler(spec)
+    try:
+        assert deferred.wait(5)
+        release.set()
+        child.join(5)
+        assert child.exitcode == 0
+        assert queue.get(timeout=2)["status"] == "ok"
+        assert second_done.wait(5)
+    finally:
+        release.set()
+        assert scheduler.stop()
+        child.join(5)
+        engine.shutdown()
+    assert len(_generation_dirs(spec)) == 1
+    assert due_flags[:2] == [True, True]
+
+
 def test_scheduler_retries_failed_transaction_without_accepting_visible_pointer(
     monkeypatch,
     tmp_path,
@@ -518,16 +799,20 @@ def test_scheduler_retries_failed_transaction_without_accepting_visible_pointer(
         completed = threading.Event()
 
         def fake_due(_spec, **_kwargs):
-            return 0.0 if not calls else 999.0
+            return (0.0 if not calls else 999.0), "existing-generation"
 
         def fake_run(_spec, *, due_only=True, **_kwargs):
             calls.append(due_only)
             if len(calls) == 1:
-                return {"ok": False, "status": "published_pointer_failed"}
+                return {
+                    "ok": False,
+                    "status": "published_pointer_failed",
+                    "pointer_renamed": True,
+                }
             completed.set()
             return {"ok": True, "status": "ok"}
 
-        monkeypatch.setattr(periodic, "_seconds_until_due", fake_due)
+        monkeypatch.setattr(periodic, "_verified_due_state", fake_due)
         monkeypatch.setattr(periodic, "run_periodic_backup", fake_run)
         monkeypatch.setattr(periodic, "_MAX_FAILURE_BACKOFF_SECONDS", 0.01)
         scheduler = periodic._Scheduler(spec)

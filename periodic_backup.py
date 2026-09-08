@@ -22,8 +22,10 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import logging
+import math
 import os
 from pathlib import Path
+import re
 import shutil
 import sqlite3
 import stat
@@ -36,12 +38,10 @@ import uuid
 
 from .externalize import (
     get_large_output_storage_dir,
-    is_externalized_placeholder,
     load_externalized_payload,
 )
 from .ingest_protection import (
-    extract_all_externalized_payload_refs,
-    is_externalized_ingest_placeholder,
+    restore_ingest_payload_placeholders,
 )
 
 
@@ -59,6 +59,22 @@ _MAX_PAYLOAD_BYTES = 64 * 1024 * 1024
 _MAX_METADATA_BYTES = 4 * 1024 * 1024
 _SCHEDULER_SHUTDOWN_TIMEOUT_SECONDS = 10.0
 _MAX_FAILURE_BACKOFF_SECONDS = 300.0
+_INGEST_MARKER_RE = re.compile(
+    r"\[Externalized LCM ingest payload:.*?;\s*ref=(?P<ref>[^;\]\s]+)\]"
+)
+_EXTERNALIZED_MARKER_RE = re.compile(
+    r"\[(?:Externalized|GC'd externalized) (?:tool output|payload):.*?;\s*ref=(?P<ref>[^;\]\s]+)\]"
+)
+_EXAMPLE_REF_PREFIXES = (
+    "example-",
+    "example_",
+    "fake-",
+    "fake_",
+    "dummy-",
+    "dummy_",
+    "placeholder-",
+    "placeholder_",
+)
 
 try:  # POSIX only by contract; Windows automatic backups fail closed.
     import fcntl as _fcntl
@@ -103,6 +119,16 @@ class PeriodicBackupRegistration:
     owner: object
     active: bool
     error: str = ""
+
+
+@dataclass(frozen=True)
+class _RecoveryReference:
+    ref: str
+    marker: str
+    marker_type: str
+    session_id: str
+    role: str
+    field: str
 
 
 def _utc_now() -> datetime:
@@ -351,7 +377,7 @@ def _integrity_check(
     *,
     cancel: threading.Event | None = None,
 ) -> None:
-    uri = f"file:{quote(str(path), safe='/')}?mode=ro"
+    uri = f"file:{quote(str(path), safe='/')}?mode=ro&immutable=1"
     conn = sqlite3.connect(uri, uri=True, timeout=_BACKUP_BUSY_TIMEOUT_SECONDS)
     try:
         if cancel is not None:
@@ -407,17 +433,102 @@ def _snapshot_database(
     _fsync_file(destination)
 
 
-def _walk_exact_placeholders(value: Any) -> list[str]:
-    refs: list[str] = []
+def _marker_metadata(marker: str, key: str) -> str:
+    match = re.search(rf"(?:^|[:;])\s*{re.escape(key)}=([^;\]\s]+)", marker)
+    return match.group(1) if match is not None else ""
+
+
+def _placeholder_metadata_value(value: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.:/-]+", "-", str(value or "?")).strip("-")
+    return (safe or "?")[:120]
+
+
+def _looks_like_quoted_or_template_example(
+    text: str,
+    *,
+    start: int,
+    end: int,
+    ref: str,
+) -> bool:
+    if not Path(ref).name.lower().startswith(_EXAMPLE_REF_PREFIXES):
+        return False
+    before = text[:start].rstrip()
+    after = text[end:].lstrip()
+    if before.endswith(("{{", "{%")) and after.startswith(("}}", "%}")):
+        return True
+    for quote_char in ('"', "'"):
+        if before.endswith(quote_char) and after.startswith(quote_char):
+            return True
+        if before.endswith("\\" + quote_char) and after.startswith("\\" + quote_char):
+            return True
+    return False
+
+
+def _references_in_text(
+    text: str,
+    *,
+    session_id: str,
+    role: str,
+    field: str,
+    allow_embedded: bool,
+) -> list[_RecoveryReference]:
+    if not isinstance(text, str) or not text:
+        return []
+    stripped = text.strip()
+    refs: list[_RecoveryReference] = []
+    matches = [
+        (match, "ingest") for match in _INGEST_MARKER_RE.finditer(text)
+    ] + [
+        (match, "externalized") for match in _EXTERNALIZED_MARKER_RE.finditer(text)
+    ]
+    for match, marker_type in sorted(matches, key=lambda item: item[0].start()):
+        marker = match.group(0)
+        exact = marker == stripped
+        if not exact and not allow_embedded:
+            continue
+        ref = match.group("ref").strip()
+        if not exact and _looks_like_quoted_or_template_example(
+            text,
+            start=match.start(),
+            end=match.end(),
+            ref=ref,
+        ):
+            continue
+        reference = _RecoveryReference(
+            ref=ref,
+            marker=marker,
+            marker_type=marker_type,
+            session_id=session_id,
+            role=role,
+            field=field,
+        )
+        if reference not in refs:
+            refs.append(reference)
+    return refs
+
+
+def _walk_recovery_references(
+    value: Any,
+    *,
+    session_id: str,
+    role: str,
+    field: str,
+) -> list[_RecoveryReference]:
+    refs: list[_RecoveryReference] = []
 
     def visit(item: Any) -> None:
         if isinstance(item, str):
+            for reference in _references_in_text(
+                item,
+                session_id=session_id,
+                role=role,
+                field=field,
+                allow_embedded=True,
+            ):
+                if reference not in refs:
+                    refs.append(reference)
             stripped = item.strip()
-            if is_externalized_placeholder(stripped) or is_externalized_ingest_placeholder(stripped):
-                for ref in extract_all_externalized_payload_refs(stripped):
-                    if ref not in refs:
-                        refs.append(ref)
-            elif stripped.startswith(("{", "[")):
+            if stripped.startswith(("{", "[")):
                 try:
                     nested = json.loads(stripped)
                 except json.JSONDecodeError:
@@ -430,7 +541,8 @@ def _walk_exact_placeholders(value: Any) -> list[str]:
                 visit(nested)
             return
         if isinstance(item, dict):
-            for nested in item.values():
+            for key, nested in item.items():
+                visit(key)
                 visit(nested)
 
     visit(value)
@@ -441,17 +553,11 @@ def _enumerate_recovery_refs(
     staged_db: Path,
     *,
     cancel: threading.Event | None,
-) -> list[str]:
-    """Find loader-reachable refs, not broad regex lookalikes.
-
-    Storage-produced content placeholders occupy the whole content value.
-    Tool-call payloads may nest those exact strings in JSON content/arguments.
-    Quoted examples, templates, log fragments, and arbitrary prose containing a
-    marker are not loader-reachable placeholders and are therefore ignored.
-    """
-    uri = f"file:{quote(str(staged_db), safe='/')}?mode=ro"
+) -> list[_RecoveryReference]:
+    """Enumerate record-context refs that the production recovery paths consume."""
+    uri = f"file:{quote(str(staged_db), safe='/')}?mode=ro&immutable=1"
     conn = sqlite3.connect(uri, uri=True, timeout=_BACKUP_BUSY_TIMEOUT_SECONDS)
-    refs: list[str] = []
+    refs: list[_RecoveryReference] = []
     try:
         if cancel is not None:
             conn.set_progress_handler(lambda: 1 if cancel.is_set() else 0, 1000)
@@ -460,32 +566,58 @@ def _enumerate_recovery_refs(
         ).fetchone()
         if table is None:
             raise PeriodicBackupError("staged database has no messages table")
-        for content, tool_calls in conn.execute(
-            "SELECT content, tool_calls FROM messages ORDER BY store_id ASC"
+        for session_id, role, content, tool_calls in conn.execute(
+            "SELECT session_id, role, content, tool_calls FROM messages ORDER BY store_id ASC"
         ):
             if cancel is not None and cancel.is_set():
                 raise PeriodicBackupCancelled(
                     "periodic backup cancelled during reference enumeration"
                 )
-            for ref in _walk_exact_placeholders(content):
-                if ref not in refs:
-                    refs.append(ref)
+            for reference in _walk_recovery_references(
+                content,
+                session_id=str(session_id or ""),
+                role=str(role or ""),
+                field="content",
+            ):
+                if reference not in refs:
+                    refs.append(reference)
             if not isinstance(tool_calls, str) or not tool_calls:
                 continue
             try:
                 parsed = json.loads(tool_calls)
             except json.JSONDecodeError as exc:
-                if "ref=" in tool_calls:
+                unresolved = _references_in_text(
+                    tool_calls,
+                    session_id=str(session_id or ""),
+                    role=str(role or ""),
+                    field="tool_calls",
+                    allow_embedded=True,
+                )
+                if unresolved:
                     raise PeriodicBackupError(
                         "tool_calls contains an unresolved externalized reference"
                     ) from exc
                 continue
-            for ref in _walk_exact_placeholders(parsed):
-                if ref not in refs:
-                    refs.append(ref)
+            for reference in _walk_recovery_references(
+                parsed,
+                session_id=str(session_id or ""),
+                role=str(role or ""),
+                field="tool_calls",
+            ):
+                if reference not in refs:
+                    refs.append(reference)
     finally:
         conn.close()
-    return sorted(refs)
+    return sorted(
+        refs,
+        key=lambda item: (
+            item.ref,
+            item.session_id,
+            item.role,
+            item.field,
+            item.marker,
+        ),
+    )
 
 
 def _owned_regular_file(file_stat: os.stat_result) -> bool:
@@ -570,8 +702,22 @@ def _copy_payload(
             decoded = json.loads(bytes(raw).decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise PeriodicBackupError(f"referenced payload is not valid JSON: {ref}") from exc
-        if not isinstance(decoded, dict) or "content" not in decoded:
+        if not isinstance(decoded, dict) or not isinstance(decoded.get("content"), str):
             raise PeriodicBackupError(f"referenced payload is not loader-compatible: {ref}")
+        content = decoded["content"]
+        for key, actual in (
+            ("content_chars", len(content)),
+            ("content_bytes", len(content.encode("utf-8"))),
+        ):
+            declared = decoded.get(key)
+            if declared is not None and (
+                isinstance(declared, bool)
+                or not isinstance(declared, int)
+                or declared != actual
+            ):
+                raise PeriodicBackupError(
+                    f"referenced payload {key} is invalid: {ref}"
+                )
         return {"basename": ref, "size": size, "sha256": digest.hexdigest()}
     except FileNotFoundError as exc:
         raise PeriodicBackupError(f"referenced payload is missing: {ref}") from exc
@@ -583,21 +729,121 @@ def _copy_payload(
         os.close(dir_fd)
 
 
-def _verify_payload_loader(
+def _read_payload_document(payload_dir: Path, ref: str) -> dict[str, Any]:
+    try:
+        decoded = json.loads((payload_dir / ref).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise PeriodicBackupError(f"copied payload is not valid JSON: {ref}") from exc
+    if not isinstance(decoded, dict):
+        raise PeriodicBackupError(f"copied payload is not a JSON object: {ref}")
+    content = decoded.get("content")
+    if not isinstance(content, str):
+        raise PeriodicBackupError(f"copied payload content is not text: {ref}")
+    for key in ("kind", "tool_call_id", "role", "session_id", "field_path"):
+        value = decoded.get(key)
+        if value is not None and not isinstance(value, str):
+            raise PeriodicBackupError(f"copied payload {key} is not text: {ref}")
+    for key, actual in (
+        ("content_chars", len(content)),
+        ("content_bytes", len(content.encode("utf-8"))),
+    ):
+        declared = decoded.get(key)
+        if declared is not None and (
+            isinstance(declared, bool)
+            or not isinstance(declared, int)
+            or declared != actual
+        ):
+            raise PeriodicBackupError(f"copied payload {key} is invalid: {ref}")
+    created_at = decoded.get("created_at")
+    if created_at is not None and (
+        isinstance(created_at, bool)
+        or not isinstance(created_at, (int, float))
+        or not math.isfinite(float(created_at))
+    ):
+        raise PeriodicBackupError(f"copied payload created_at is invalid: {ref}")
+    return decoded
+
+
+def _validate_payload_context(
     payload_dir: Path,
-    entries: list[dict[str, Any]],
+    reference: _RecoveryReference,
+) -> None:
+    payload = _read_payload_document(payload_dir, reference.ref)
+    payload_session = str(payload.get("session_id") or "")
+    if payload_session and reference.session_id and payload_session != reference.session_id:
+        raise PeriodicBackupError(
+            f"copied payload session identity mismatch: {reference.ref}"
+        )
+    payload_role = str(payload.get("role") or "")
+    if payload_role and reference.role and payload_role != reference.role:
+        raise PeriodicBackupError(f"copied payload role mismatch: {reference.ref}")
+
+    if reference.marker_type == "ingest":
+        if payload.get("kind") != "ingest_payload":
+            raise PeriodicBackupError(f"copied ingest payload kind mismatch: {reference.ref}")
+        marker_kind = _marker_metadata(reference.marker, "kind")
+        if marker_kind and marker_kind != "ingest_payload":
+            raise PeriodicBackupError(f"ingest marker kind is unsupported: {reference.ref}")
+        marker_field = _marker_metadata(reference.marker, "field")
+        payload_field = str(payload.get("field_path") or "")
+        if marker_field and _placeholder_metadata_value(payload_field) != marker_field:
+            raise PeriodicBackupError(f"copied ingest payload field mismatch: {reference.ref}")
+        if payload_field and not (
+            payload_field == reference.field
+            or payload_field.startswith(reference.field + ".")
+            or payload_field.startswith(reference.field + "[")
+        ):
+            raise PeriodicBackupError(f"copied ingest payload field context mismatch: {reference.ref}")
+        config = SimpleNamespace(large_output_externalization_path=str(payload_dir))
+        restored = restore_ingest_payload_placeholders(
+            reference.marker,
+            config=config,
+            session_id=reference.session_id,
+        )
+        if restored == reference.marker:
+            raise PeriodicBackupError(
+                f"existing ingest recovery rejected copied payload: {reference.ref}"
+            )
+    else:
+        expected_kind = _marker_metadata(reference.marker, "kind")
+        if not expected_kind and "tool output:" in reference.marker:
+            expected_kind = "tool_result"
+        actual_kind = str(payload.get("kind") or "tool_result")
+        if expected_kind and actual_kind != expected_kind:
+            raise PeriodicBackupError(f"copied payload kind mismatch: {reference.ref}")
+        marker_role = _marker_metadata(reference.marker, "role")
+        if marker_role and payload_role and marker_role != payload_role:
+            raise PeriodicBackupError(f"copied payload marker role mismatch: {reference.ref}")
+        marker_call_id = _marker_metadata(reference.marker, "tool_call_id")
+        payload_call_id = str(payload.get("tool_call_id") or "")
+        if marker_call_id and marker_call_id != "?" and marker_call_id != payload_call_id:
+            raise PeriodicBackupError(
+                f"copied payload tool-call identity mismatch: {reference.ref}"
+            )
+
+    config = SimpleNamespace(large_output_externalization_path=str(payload_dir))
+    try:
+        loaded = load_externalized_payload(reference.ref, config=config)
+    except Exception as exc:
+        raise PeriodicBackupError(
+            f"existing payload loader raised for copied payload: {reference.ref}"
+        ) from exc
+    if loaded is None or loaded.get("content") != payload["content"]:
+        raise PeriodicBackupError(
+            f"existing payload loader rejected copied payload: {reference.ref}"
+        )
+
+
+def _verify_payload_recovery(
+    payload_dir: Path,
+    references: list[_RecoveryReference],
     *,
     cancel: threading.Event | None = None,
 ) -> None:
-    config = SimpleNamespace(large_output_externalization_path=str(payload_dir))
-    for entry in entries:
+    for reference in references:
         if cancel is not None and cancel.is_set():
             raise PeriodicBackupCancelled("periodic backup cancelled during loader verification")
-        loaded = load_externalized_payload(str(entry["basename"]), config=config)
-        if loaded is None or "content" not in loaded:
-            raise PeriodicBackupError(
-                f"existing payload loader rejected copied payload: {entry['basename']}"
-            )
+        _validate_payload_context(payload_dir, reference)
 
 
 def _generation_manifest(
@@ -668,7 +914,13 @@ def _verify_generation(
     }
     if actual != seen:
         raise PeriodicBackupError("generation payload set does not match manifest")
-    _verify_payload_loader(payload_dir, payloads, cancel=cancel)
+    references = _enumerate_recovery_refs(db_path, cancel=cancel)
+    expected_refs = {reference.ref for reference in references}
+    if expected_refs != seen:
+        raise PeriodicBackupError(
+            "generation payload set does not match staged database references"
+        )
+    _verify_payload_recovery(payload_dir, references, cancel=cancel)
     _parse_utc(manifest.get("completed_at"))
     return manifest
 
@@ -698,24 +950,45 @@ def _read_verified_pointer(
     return generation, manifest
 
 
-def _seconds_until_due(
+def _seconds_from_verified_pointer(
     spec: PeriodicBackupSpec,
+    verified: tuple[Path, dict[str, Any]] | None,
     *,
     now: datetime | None = None,
-    cancel: threading.Event | None = None,
 ) -> float:
-    if not spec.namespace.exists():
-        return 0.0
-    try:
-        verified = _read_verified_pointer(spec, cancel=cancel)
-    except (OSError, sqlite3.Error, PeriodicBackupError):
-        return 0.0
     if verified is None:
         return 0.0
     completed = _parse_utc(verified[1]["completed_at"])
     wall_now = (now or _utc_now()).astimezone(timezone.utc)
     elapsed = max(0.0, (wall_now - completed).total_seconds())
     return max(0.0, spec.interval_seconds - elapsed)
+
+
+def _verified_due_state(
+    spec: PeriodicBackupSpec,
+    *,
+    now: datetime | None = None,
+    cancel: threading.Event | None = None,
+) -> tuple[float, str | None]:
+    if not spec.namespace.exists():
+        return 0.0, None
+    try:
+        verified = _read_verified_pointer(spec, cancel=cancel)
+    except (OSError, sqlite3.Error, PeriodicBackupError):
+        return 0.0, None
+    return (
+        _seconds_from_verified_pointer(spec, verified, now=now),
+        verified[0].name if verified is not None else None,
+    )
+
+
+def _seconds_until_due(
+    spec: PeriodicBackupSpec,
+    *,
+    now: datetime | None = None,
+    cancel: threading.Event | None = None,
+) -> float:
+    return _verified_due_state(spec, now=now, cancel=cancel)[0]
 
 
 class _NamespaceLock:
@@ -868,6 +1141,7 @@ def run_periodic_backup(
     now: datetime | None = None,
     cancel: threading.Event | None = None,
     _fault: FaultHook | None = None,
+    _force_due_if_generation: str | None = None,
 ) -> dict[str, Any]:
     """Attempt one locked backup transaction without touching the live DB.
 
@@ -890,10 +1164,22 @@ def run_periodic_backup(
             _call_fault(_fault, "locked")
             # Existing metadata is an ownership boundary.  Never overwrite a
             # corrupt or foreign pointer and then treat that as recovery.
+            verified = None
             if (spec.namespace / _POINTER_NAME).exists():
-                _read_verified_pointer(spec, cancel=cancel)
-            if due_only and _seconds_until_due(spec, now=started, cancel=cancel) > 0:
-                return {"ok": True, "status": "noop_not_due", "namespace": spec.namespace}
+                verified = _read_verified_pointer(spec, cancel=cancel)
+            current_generation_id = verified[0].name if verified is not None else None
+            due_in = _seconds_from_verified_pointer(spec, verified, now=started)
+            force_monotonic_due = (
+                _force_due_if_generation is not None
+                and current_generation_id == _force_due_if_generation
+            )
+            if due_only and due_in > 0 and not force_monotonic_due:
+                return {
+                    "ok": True,
+                    "status": "noop_not_due",
+                    "namespace": spec.namespace,
+                    "generation_id": current_generation_id,
+                }
             if cancel is not None and cancel.is_set():
                 return {"ok": False, "status": "cancelled", "namespace": spec.namespace}
 
@@ -910,9 +1196,9 @@ def run_periodic_backup(
             _call_fault(_fault, "integrity")
             _integrity_check(staged_db, cancel=cancel)
 
-            refs = _enumerate_recovery_refs(staged_db, cancel=cancel)
+            references = _enumerate_recovery_refs(staged_db, cancel=cancel)
             payload_entries: list[dict[str, Any]] = []
-            for ref in refs:
+            for ref in sorted({reference.ref for reference in references}):
                 _call_fault(_fault, f"payload:{ref}")
                 payload_entries.append(
                     _copy_payload(
@@ -923,7 +1209,7 @@ def run_periodic_backup(
                     )
                 )
             _fsync_directory(payload_dir)
-            _verify_payload_loader(payload_dir, payload_entries, cancel=cancel)
+            _verify_payload_recovery(payload_dir, references, cancel=cancel)
 
             database_size, database_hash = _sha256_file(staged_db, cancel=cancel)
             completed_at = _utc_text(_utc_now())
@@ -983,6 +1269,7 @@ def run_periodic_backup(
                     "ok": False,
                     "status": "published_pointer_failed",
                     "generation": final,
+                    "generation_id": generation_id,
                     "pointer_durability": "uncertain" if exc.renamed else "unchanged",
                     "pointer_renamed": exc.renamed,
                     "error": str(exc),
@@ -1005,6 +1292,7 @@ def run_periodic_backup(
                     "ok": True,
                     "status": "ok_retention_failed",
                     "generation": final,
+                    "generation_id": generation_id,
                     "deleted": deleted,
                     "retention_error": retention_error,
                 }
@@ -1012,6 +1300,7 @@ def run_periodic_backup(
                 "ok": True,
                 "status": "ok",
                 "generation": final,
+                "generation_id": generation_id,
                 "deleted": deleted,
                 "payload_count": len(payload_entries),
             }
@@ -1019,7 +1308,7 @@ def run_periodic_backup(
         return {"ok": False, "status": "unsupported", "error": str(exc)}
     except PeriodicBackupCancelled as exc:
         return {"ok": False, "status": "cancelled", "error": str(exc)}
-    except (OSError, sqlite3.Error, PeriodicBackupError, ValueError, TypeError) as exc:
+    except Exception as exc:
         return {
             "ok": False,
             "status": "failed",
@@ -1047,36 +1336,70 @@ class _Scheduler:
 
     def _run(self) -> None:
         retry_delay = 0.0
+        force_uncertain_retry = False
+        try:
+            due_in, observed_generation = _verified_due_state(
+                self.spec,
+                cancel=self.cancel,
+            )
+        except Exception:
+            due_in, observed_generation = 0.0, None
+        next_due_monotonic = time.monotonic() + due_in
         while not self.cancel.is_set():
-            try:
-                due_in = _seconds_until_due(self.spec, cancel=self.cancel)
-            except Exception:
-                due_in = 0.0
             retrying_failed_transaction = retry_delay > 0
-            wait_for = retry_delay if retrying_failed_transaction else due_in
+            wait_for = (
+                retry_delay
+                if retrying_failed_transaction
+                else max(0.0, next_due_monotonic - time.monotonic())
+            )
             if wait_for > 0:
                 with self.condition:
                     self.condition.wait_for(self.cancel.is_set, timeout=wait_for)
                 if self.cancel.is_set():
                     return
-            # A failed transaction never advances this process's last-success
-            # schedule.  Retry it even if an uncertain pointer rename is visible
-            # in the same process; only a fresh scheduler/restart may recover
-            # that pointer by full verification.
-            result = run_periodic_backup(
-                self.spec,
-                due_only=not retrying_failed_transaction,
-                cancel=self.cancel,
-            )
+            monotonic_due = time.monotonic() >= next_due_monotonic
+            try:
+                result = run_periodic_backup(
+                    self.spec,
+                    due_only=not force_uncertain_retry,
+                    cancel=self.cancel,
+                    _force_due_if_generation=(
+                        observed_generation if monotonic_due else None
+                    ),
+                )
+            except Exception as exc:
+                result = {"ok": False, "status": "failed", "error": str(exc)}
             status = str(result.get("status") or "failed")
-            if status in {"ok", "ok_retention_failed", "noop_not_due"}:
+            if status in {"ok", "ok_retention_failed"}:
+                observed_generation = str(result.get("generation_id") or "") or None
+                next_due_monotonic = time.monotonic() + self.spec.interval_seconds
                 retry_delay = 0.0
+                force_uncertain_retry = False
+            elif status == "noop_not_due":
+                try:
+                    due_in, verified_generation = _verified_due_state(
+                        self.spec,
+                        cancel=self.cancel,
+                    )
+                except Exception:
+                    due_in, verified_generation = 0.0, None
+                observed_generation = (
+                    str(result.get("generation_id") or "")
+                    or verified_generation
+                )
+                next_due_monotonic = time.monotonic() + due_in
+                retry_delay = 0.0
+                force_uncertain_retry = False
             elif status == "cancelled":
                 return
             else:
                 retry_delay = min(
                     _MAX_FAILURE_BACKOFF_SECONDS,
                     max(1.0, min(60.0, self.spec.interval_seconds / 4.0)),
+                )
+                force_uncertain_retry = bool(
+                    status == "published_pointer_failed"
+                    and result.get("pointer_renamed")
                 )
                 logger.warning(
                     "LCM periodic backup deferred or failed status=%s source=%s error=%s",

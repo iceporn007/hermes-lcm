@@ -254,6 +254,10 @@ versioned bundles under
 publication. Retention is confined to that source namespace. Advisory locking
 and directory fsync must both work or the automatic operation fails closed.
 Network-filesystem and multi-host locking/durability are not guaranteed.
+Reference verification follows recovery semantics for whole and inline message
+content plus nested tool-call arguments. Malformed references, payload schema or
+record-identity mismatches, and incomplete persisted bundles fail closed without
+advancing `latest-good.json` or pruning an older verified generation.
 
 The scheduler never commits an application connection and never restores or
 replaces the live database. Recovery is an explicit offline operator action:
