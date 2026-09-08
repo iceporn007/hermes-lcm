@@ -1,5 +1,6 @@
 """LCM configuration with defaults and env var overrides."""
 import logging
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -369,6 +370,10 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("summary_timeout_ms", "LCM_SUMMARY_TIMEOUT_MS", int),
     _EnvFieldSpec("expansion_timeout_ms", "LCM_EXPANSION_TIMEOUT_MS", int),
     _EnvFieldSpec("database_path", "LCM_DATABASE_PATH", str),
+    _EnvFieldSpec("periodic_backup_enabled", "LCM_PERIODIC_BACKUP_ENABLED", bool),
+    _EnvFieldSpec("periodic_backup_interval_hours", "LCM_PERIODIC_BACKUP_INTERVAL_HOURS", float),
+    _EnvFieldSpec("periodic_backup_keep_last", "LCM_PERIODIC_BACKUP_KEEP_LAST", int),
+    _EnvFieldSpec("periodic_backup_path", "LCM_PERIODIC_BACKUP_PATH", str),
     _EnvFieldSpec("embeddings_enabled", "LCM_EMBEDDINGS_ENABLED", bool),
     _EnvFieldSpec("rerank_enabled", "LCM_RERANK_ENABLED", bool),
     _EnvFieldSpec("recall_scan_rows", "LCM_RECALL_SCAN_ROWS", int),
@@ -429,6 +434,10 @@ _SOURCE_TRACKED_ENV_FIELDS = frozenset({
     "summary_spend_window_seconds",
     "summary_spend_backoff_seconds",
     "summary_timeout_ms",
+    "periodic_backup_enabled",
+    "periodic_backup_interval_hours",
+    "periodic_backup_keep_last",
+    "periodic_backup_path",
 })
 
 # Fields exposed as runtime preset overrides (consumed by presets.py).
@@ -602,6 +611,12 @@ class LCMConfig:
 
     # -- Storage ---
     database_path: str = ""       # empty = HERMES_HOME/lcm.db; LCM_DATABASE_PATH may override
+    # Default-off verified SQLite + externalized-payload bundle scheduling.
+    periodic_backup_enabled: bool = False
+    periodic_backup_interval_hours: float = 6.0
+    periodic_backup_keep_last: int = 10
+    # Empty = backup_dir()/periodic; each source receives a SHA-256 namespace.
+    periodic_backup_path: str = ""
 
     # -- Embeddings (default-off until a provider/model are configured) ---
     embeddings_enabled: bool = False
@@ -776,6 +791,27 @@ class LCMConfig:
     config_source_warnings: list[str] = field(default_factory=list)
     ignored_config_yaml_lcm_keys: list[str] = field(default_factory=list)
 
+    def __post_init__(self) -> None:
+        self.validate_periodic_backup()
+
+    def validate_periodic_backup(self) -> None:
+        """Reject unsafe or ambiguous periodic-backup scalar values."""
+        if not isinstance(self.periodic_backup_enabled, bool):
+            raise ValueError("periodic_backup_enabled must be a boolean")
+        interval = self.periodic_backup_interval_hours
+        if (
+            isinstance(interval, bool)
+            or not isinstance(interval, (int, float))
+            or not math.isfinite(float(interval))
+            or float(interval) <= 0.0
+        ):
+            raise ValueError("periodic_backup_interval_hours must be finite and greater than zero")
+        keep_last = self.periodic_backup_keep_last
+        if isinstance(keep_last, bool) or not isinstance(keep_last, int) or keep_last < 1:
+            raise ValueError("periodic_backup_keep_last must be an integer greater than zero")
+        if not isinstance(self.periodic_backup_path, str):
+            raise ValueError("periodic_backup_path must be a string")
+
     @classmethod
     def from_env(cls) -> "LCMConfig":
         """Build config from environment variables (LCM_ prefix)."""
@@ -841,6 +877,32 @@ class LCMConfig:
         )
         _record("summary_timeout_ms", source, warning)
 
+        raw_periodic_enabled = os.environ.get("LCM_PERIODIC_BACKUP_ENABLED")
+        if raw_periodic_enabled is not None:
+            normalized = raw_periodic_enabled.strip().lower()
+            if normalized not in {"1", "true", "yes", "on", "0", "false", "no", "off"}:
+                raise ValueError("LCM_PERIODIC_BACKUP_ENABLED must be a boolean")
+            c.periodic_backup_enabled = normalized in {"1", "true", "yes", "on"}
+        raw_periodic_interval = os.environ.get("LCM_PERIODIC_BACKUP_INTERVAL_HOURS")
+        if raw_periodic_interval is not None:
+            try:
+                c.periodic_backup_interval_hours = float(raw_periodic_interval)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "LCM_PERIODIC_BACKUP_INTERVAL_HOURS must be a finite number greater than zero"
+                ) from exc
+        raw_periodic_keep = os.environ.get("LCM_PERIODIC_BACKUP_KEEP_LAST")
+        if raw_periodic_keep is not None:
+            try:
+                c.periodic_backup_keep_last = int(raw_periodic_keep)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "LCM_PERIODIC_BACKUP_KEEP_LAST must be an integer greater than zero"
+                ) from exc
+        raw_periodic_path = os.environ.get("LCM_PERIODIC_BACKUP_PATH")
+        if raw_periodic_path is not None:
+            c.periodic_backup_path = raw_periodic_path
+
         # Every other scalar LCM_* override is applied uniformly from the spec.
         for spec in ENV_FIELD_SPECS:
             if spec.name in _SOURCE_TRACKED_ENV_FIELDS:
@@ -887,4 +949,5 @@ class LCMConfig:
 
         c.config_sources = config_sources
         c.config_source_warnings = config_source_warnings
+        c.validate_periodic_backup()
         return c

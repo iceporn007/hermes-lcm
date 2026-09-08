@@ -221,6 +221,10 @@ environment variables:
 | `LCM_ROLLUP_BUILDS_PER_PASS` | `2` | Maximum rollups built by one automatic pass or `/lcm rollups rebuild` command |
 | `LCM_EXPANSION_TIMEOUT_MS` | `120000` | Timeout for one `lcm_expand_query` synthesis call |
 | `LCM_DATABASE_PATH` | auto | SQLite database path. Empty config resolves to `HERMES_HOME/lcm.db`; plugin installs or operators may set this env var to another profile-scoped path such as `~/.hermes/hermes-lcm.db`. |
+| `LCM_PERIODIC_BACKUP_ENABLED` | `false` | Enable verified periodic SQLite + referenced-payload backup bundles. Never restores automatically. |
+| `LCM_PERIODIC_BACKUP_INTERVAL_HOURS` | `6.0` | Hours between verified successful generations; must be finite and greater than zero. |
+| `LCM_PERIODIC_BACKUP_KEEP_LAST` | `10` | Number of newest owned generations retained per canonical source database; must be at least one. |
+| `LCM_PERIODIC_BACKUP_PATH` | empty | Destination root. Empty resolves to `backup_dir()/periodic`; each source uses a full SHA-256 canonical-path namespace. |
 | `LCM_FTS_INTEGRITY_CHECK_INTERVAL_HOURS` | `24` | Minimum hours between startup FTS5 deep integrity-checks (O(index size)). `0` checks every startup (previous behavior); a negative value never checks on startup. Structural checks always run regardless. |
 | `LCM_ENABLE_SLASH_COMMAND` | `false` | Enable the optional `/lcm` operator command surface |
 | `LCM_EMBEDDINGS_ENABLED` | `false` | Opt in to embedding warmup, backfill, and semantic retrieval storage |
@@ -238,6 +242,28 @@ environment variables:
 | `LCM_EMPTY_LIFECYCLE_GC_ENABLED` | `true` | Master toggle for automatic pruning of lifecycle rows for sessions that never ingested any messages or summary nodes |
 | `LCM_EMPTY_LIFECYCLE_GC_THRESHOLD` | `200` | Number of lifecycle rows at which the GC pass fires (default 200 so fresh installs skip the work) |
 | `LCM_EMPTY_LIFECYCLE_GC_MAX_AGE_HOURS` | `24` | Automatic GC only deletes empty lifecycle rows at least this old; set `0` only in trusted/test environments that intentionally want immediate empty-row pruning |
+
+### Periodic backup safety boundary
+
+Periodic backup is disabled by default. When enabled on a supported POSIX local
+filesystem, one idle-capable worker per canonical database creates private,
+versioned bundles under
+`<destination>/<sha256(canonical absolute database path)>/`. Each bundle holds
+`lcm.sqlite3`, every exact externalized payload referenced by the staged DB, and
+`manifest.json`; `latest-good.json` moves only after verification and durable
+publication. Retention is confined to that source namespace. Advisory locking
+and directory fsync must both work or the automatic operation fails closed.
+Network-filesystem and multi-host locking/durability are not guaranteed.
+
+The scheduler never commits an application connection and never restores or
+replaces the live database. Recovery is an explicit offline operator action:
+stop all writers, independently verify the manifest hashes and SQLite integrity,
+copy the bundle database and payload directory into disposable paths first, and
+only then choose whether to replace configured live paths. Canonical path aliases
+share an identity after symlink resolution; source hardlink aliases are not
+claimed to do so. Referenced symlinked, multiply-linked, missing, invalid, or
+changing payloads reject the candidate and leave the previous good generation
+available.
 
 ### Evidence and adaptive retrieval (0.21 RC)
 
