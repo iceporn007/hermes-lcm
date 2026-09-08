@@ -2,6 +2,7 @@
 import logging
 import math
 import os
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -806,6 +807,14 @@ class LCMConfig:
             or float(interval) <= 0.0
         ):
             raise ValueError("periodic_backup_interval_hours must be finite and greater than zero")
+        interval_seconds = float(interval) * 3600.0
+        if (
+            not math.isfinite(interval_seconds)
+            or interval_seconds > threading.TIMEOUT_MAX
+        ):
+            raise ValueError(
+                "periodic_backup_interval_hours exceeds the platform scheduler timeout limit"
+            )
         keep_last = self.periodic_backup_keep_last
         if isinstance(keep_last, bool) or not isinstance(keep_last, int) or keep_last < 1:
             raise ValueError("periodic_backup_keep_last must be an integer greater than zero")

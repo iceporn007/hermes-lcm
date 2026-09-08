@@ -115,7 +115,7 @@ def _run_holding_backup(spec, acquired, release, result_queue) -> None:
     result_queue.put(periodic.run_periodic_backup(spec, due_only=False, _fault=fault))
 
 
-def test_periodic_config_defaults_env_and_strict_validation(monkeypatch):
+def test_periodic_config_defaults_env_and_strict_validation(monkeypatch, tmp_path):
     config = LCMConfig()
     assert config.periodic_backup_enabled is False
     assert config.periodic_backup_interval_hours == 6.0
@@ -137,6 +137,7 @@ def test_periodic_config_defaults_env_and_strict_validation(monkeypatch):
         ("LCM_PERIODIC_BACKUP_INTERVAL_HOURS", "nan"),
         ("LCM_PERIODIC_BACKUP_INTERVAL_HOURS", "0"),
         ("LCM_PERIODIC_BACKUP_INTERVAL_HOURS", "inf"),
+        ("LCM_PERIODIC_BACKUP_INTERVAL_HOURS", "1e308"),
         ("LCM_PERIODIC_BACKUP_KEEP_LAST", "0"),
         ("LCM_PERIODIC_BACKUP_KEEP_LAST", "1.5"),
     ]
@@ -153,7 +154,21 @@ def test_periodic_config_defaults_env_and_strict_validation(monkeypatch):
     with pytest.raises(ValueError):
         LCMConfig(periodic_backup_interval_hours=float("nan"))
     with pytest.raises(ValueError):
+        LCMConfig(periodic_backup_interval_hours=1e308)
+    with pytest.raises(ValueError):
+        LCMConfig(
+            periodic_backup_interval_hours=(threading.TIMEOUT_MAX + 1.0) / 3600.0
+        )
+    with pytest.raises(ValueError):
         LCMConfig(periodic_backup_keep_last=True)
+
+    engine = _engine(tmp_path / "mutated-config")
+    try:
+        engine._config.periodic_backup_interval_hours = 1e308
+        with pytest.raises(periodic.PeriodicBackupError, match="scheduler timeout"):
+            periodic.build_periodic_backup_spec(engine)
+    finally:
+        engine.shutdown()
 
 
 def test_disabled_is_filesystem_noop_and_idle_scheduler_owns_clones(tmp_path):
@@ -788,41 +803,105 @@ def test_scheduler_rechecks_due_after_other_process_publishes(tmp_path, monkeypa
     assert due_flags[:2] == [True, True]
 
 
-def test_scheduler_retries_failed_transaction_without_accepting_visible_pointer(
-    monkeypatch,
-    tmp_path,
-):
-    engine = _engine(tmp_path)
-    try:
-        spec = periodic.build_periodic_backup_spec(engine)
-        calls: list[bool] = []
-        completed = threading.Event()
+def test_scheduler_retries_its_own_uncertain_generation(monkeypatch, tmp_path):
+    engine = _engine(tmp_path, interval_hours=1.0)
+    spec = periodic.build_periodic_backup_spec(engine)
+    real_run = periodic.run_periodic_backup
+    completed = threading.Event()
+    results: list[dict] = []
 
-        def fake_due(_spec, **_kwargs):
-            return (0.0 if not calls else 999.0), "existing-generation"
+    def fail_pointer_fsync(stage: str) -> None:
+        if stage == "pointer_fsync":
+            raise OSError("synthetic uncertainty after pointer rename")
 
-        def fake_run(_spec, *, due_only=True, **_kwargs):
-            calls.append(due_only)
-            if len(calls) == 1:
-                return {
-                    "ok": False,
-                    "status": "published_pointer_failed",
-                    "pointer_renamed": True,
-                }
+    def observe(*args, **kwargs):
+        result = (
+            real_run(*args, **kwargs, _fault=fail_pointer_fsync)
+            if not results
+            else real_run(*args, **kwargs)
+        )
+        results.append(result)
+        if len(results) >= 2:
             completed.set()
-            return {"ok": True, "status": "ok"}
+        return result
 
-        monkeypatch.setattr(periodic, "_verified_due_state", fake_due)
-        monkeypatch.setattr(periodic, "run_periodic_backup", fake_run)
-        monkeypatch.setattr(periodic, "_MAX_FAILURE_BACKOFF_SECONDS", 0.01)
-        scheduler = periodic._Scheduler(spec)
-        try:
-            assert completed.wait(2)
-        finally:
-            assert scheduler.stop() is True
-        assert calls[:2] == [True, False]
+    monkeypatch.setattr(periodic, "run_periodic_backup", observe)
+    monkeypatch.setattr(periodic, "_MAX_FAILURE_BACKOFF_SECONDS", 0.05)
+    scheduler = periodic._Scheduler(spec)
+    try:
+        assert completed.wait(5)
     finally:
+        assert scheduler.stop() is True
         engine.shutdown()
+
+    assert [result["status"] for result in results[:2]] == [
+        "published_pointer_failed",
+        "ok",
+    ]
+    assert len(_generation_dirs(spec)) == 2
+
+
+def test_uncertain_retry_is_suppressed_by_other_process_success(monkeypatch, tmp_path):
+    engine = _engine(tmp_path, interval_hours=1.0)
+    spec = periodic.build_periodic_backup_spec(engine)
+    context = multiprocessing.get_context("fork")
+    queue = context.Queue()
+    real_run = periodic.run_periodic_backup
+    retry_ready = threading.Event()
+    resume_retry = threading.Event()
+    retry_done = threading.Event()
+    results: list[dict] = []
+
+    def fail_pointer_fsync(stage: str) -> None:
+        if stage == "pointer_fsync":
+            raise OSError("synthetic uncertainty after pointer rename")
+
+    def observe(*args, **kwargs):
+        if not results:
+            result = real_run(*args, **kwargs, _fault=fail_pointer_fsync)
+        else:
+            retry_ready.set()
+            assert resume_retry.wait(5)
+            result = real_run(*args, **kwargs)
+        results.append(result)
+        if len(results) >= 2:
+            retry_done.set()
+        return result
+
+    def publish_from_other_process() -> None:
+        periodic.run_periodic_backup = real_run
+        queue.put(periodic.run_periodic_backup(spec, due_only=False))
+
+    monkeypatch.setattr(periodic, "run_periodic_backup", observe)
+    monkeypatch.setattr(periodic, "_MAX_FAILURE_BACKOFF_SECONDS", 0.05)
+    scheduler = periodic._Scheduler(spec)
+    child = None
+    try:
+        assert retry_ready.wait(5)
+        assert results[0]["status"] == "published_pointer_failed"
+        assert results[0]["pointer_renamed"] is True
+
+        child = context.Process(target=publish_from_other_process)
+        child.start()
+        child.join(5)
+        assert child.exitcode == 0
+        assert queue.get(timeout=2)["status"] == "ok"
+        assert real_run(spec, due_only=True)["status"] == "noop_not_due"
+
+        resume_retry.set()
+        assert retry_done.wait(5)
+    finally:
+        resume_retry.set()
+        assert scheduler.stop() is True
+        if child is not None:
+            child.join(5)
+        engine.shutdown()
+
+    assert [result["status"] for result in results[:2]] == [
+        "published_pointer_failed",
+        "noop_not_due",
+    ]
+    assert len(_generation_dirs(spec)) == 2
 
 
 def test_concurrent_sqlite_writer_yields_consistent_committed_snapshot(tmp_path):

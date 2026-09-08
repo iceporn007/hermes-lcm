@@ -222,7 +222,7 @@ environment variables:
 | `LCM_EXPANSION_TIMEOUT_MS` | `120000` | Timeout for one `lcm_expand_query` synthesis call |
 | `LCM_DATABASE_PATH` | auto | SQLite database path. Empty config resolves to `HERMES_HOME/lcm.db`; plugin installs or operators may set this env var to another profile-scoped path such as `~/.hermes/hermes-lcm.db`. |
 | `LCM_PERIODIC_BACKUP_ENABLED` | `false` | Enable verified periodic SQLite + referenced-payload backup bundles. Never restores automatically. |
-| `LCM_PERIODIC_BACKUP_INTERVAL_HOURS` | `6.0` | Hours between verified successful generations; must be finite and greater than zero. |
+| `LCM_PERIODIC_BACKUP_INTERVAL_HOURS` | `6.0` | Hours between verified successful generations; must be finite, greater than zero, and fit the platform scheduler timeout after conversion to seconds. |
 | `LCM_PERIODIC_BACKUP_KEEP_LAST` | `10` | Number of newest owned generations retained per canonical source database; must be at least one. |
 | `LCM_PERIODIC_BACKUP_PATH` | empty | Destination root. Empty resolves to `backup_dir()/periodic`; each source uses a full SHA-256 canonical-path namespace. |
 | `LCM_FTS_INTEGRITY_CHECK_INTERVAL_HOURS` | `24` | Minimum hours between startup FTS5 deep integrity-checks (O(index size)). `0` checks every startup (previous behavior); a negative value never checks on startup. Structural checks always run regardless. |

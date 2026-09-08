@@ -174,13 +174,25 @@ def build_periodic_backup_spec(engine) -> PeriodicBackupSpec:
         hermes_home=str(getattr(engine, "_hermes_home", "") or ""),
         create=False,
     ).resolve(strict=False)
+    try:
+        interval_seconds = float(engine._config.periodic_backup_interval_hours) * 3600.0
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise PeriodicBackupError("periodic backup interval is invalid") from exc
+    if (
+        not math.isfinite(interval_seconds)
+        or interval_seconds <= 0.0
+        or interval_seconds > threading.TIMEOUT_MAX
+    ):
+        raise PeriodicBackupError(
+            "periodic backup interval is invalid or exceeds the platform scheduler timeout limit"
+        )
     return PeriodicBackupSpec(
         source_db=source_db,
         source_identity=identity,
         payload_root=payload_root,
         destination_root=destination_root,
         namespace=destination_root / identity,
-        interval_seconds=float(engine._config.periodic_backup_interval_hours) * 3600.0,
+        interval_seconds=interval_seconds,
         keep_last=int(engine._config.periodic_backup_keep_last),
     )
 
@@ -1336,7 +1348,7 @@ class _Scheduler:
 
     def _run(self) -> None:
         retry_delay = 0.0
-        force_uncertain_retry = False
+        uncertain_generation_id: str | None = None
         try:
             due_in, observed_generation = _verified_due_state(
                 self.spec,
@@ -1358,14 +1370,19 @@ class _Scheduler:
                 if self.cancel.is_set():
                     return
             monotonic_due = time.monotonic() >= next_due_monotonic
+            # A post-rename fsync failure may retry early only while the pointer
+            # still names that exact uncertain generation.  The transaction
+            # compares this identity under the namespace flock, so a verified
+            # generation from another process suppresses redundant publication.
+            force_generation_id = uncertain_generation_id
+            if force_generation_id is None and monotonic_due:
+                force_generation_id = observed_generation
             try:
                 result = run_periodic_backup(
                     self.spec,
-                    due_only=not force_uncertain_retry,
+                    due_only=True,
                     cancel=self.cancel,
-                    _force_due_if_generation=(
-                        observed_generation if monotonic_due else None
-                    ),
+                    _force_due_if_generation=force_generation_id,
                 )
             except Exception as exc:
                 result = {"ok": False, "status": "failed", "error": str(exc)}
@@ -1374,7 +1391,7 @@ class _Scheduler:
                 observed_generation = str(result.get("generation_id") or "") or None
                 next_due_monotonic = time.monotonic() + self.spec.interval_seconds
                 retry_delay = 0.0
-                force_uncertain_retry = False
+                uncertain_generation_id = None
             elif status == "noop_not_due":
                 try:
                     due_in, verified_generation = _verified_due_state(
@@ -1389,7 +1406,7 @@ class _Scheduler:
                 )
                 next_due_monotonic = time.monotonic() + due_in
                 retry_delay = 0.0
-                force_uncertain_retry = False
+                uncertain_generation_id = None
             elif status == "cancelled":
                 return
             else:
@@ -1397,10 +1414,10 @@ class _Scheduler:
                     _MAX_FAILURE_BACKOFF_SECONDS,
                     max(1.0, min(60.0, self.spec.interval_seconds / 4.0)),
                 )
-                force_uncertain_retry = bool(
-                    status == "published_pointer_failed"
-                    and result.get("pointer_renamed")
-                )
+                if status == "published_pointer_failed" and result.get("pointer_renamed"):
+                    candidate = str(result.get("generation_id") or "")
+                    if candidate:
+                        uncertain_generation_id = candidate
                 logger.warning(
                     "LCM periodic backup deferred or failed status=%s source=%s error=%s",
                     status,
