@@ -75,9 +75,16 @@ def _placeholder(ref: str) -> str:
     return f"[Externalized tool output: tool_call_id=call-1; chars=7; bytes=7; ref={ref}]"
 
 
-def _append(engine: LCMEngine, *, content: str, tool_calls=None, role: str = "tool") -> None:
+def _append(
+    engine: LCMEngine,
+    *,
+    content: str,
+    tool_calls=None,
+    role: str = "tool",
+    session_id: str = "session",
+) -> None:
     engine._store.append(
-        "session",
+        session_id,
         {
             "role": role,
             "content": content,
@@ -1221,6 +1228,125 @@ def test_production_quarantined_assistant_ref_survives_disposable_recovery(tmp_p
         assert restored_payload is not None
         assert restored_payload["content"] == original
         assert restored_payload["kind"] == "quarantined_assistant_output"
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("session_id", "metadata_key"),
+    [
+        ("séance", "métadonnée"),
+        ("会話", "追加情報"),
+        ("thread-😀", "emoji-😀"),
+    ],
+)
+@pytest.mark.parametrize("serialization", ["production", "raw-utf8", "escaped"])
+def test_production_payload_unicode_metadata_survives_disposable_recovery(
+    tmp_path, session_id, metadata_key, serialization
+):
+    engine = _engine(tmp_path)
+    try:
+        original = 'actual UTF-8 content café 😀 with "escapes"\n'
+        created = externalize_ingest_payload(
+            original,
+            role="user",
+            session_id=session_id,
+            field_path="content",
+            config=engine._config,
+            hermes_home=engine._hermes_home,
+        )
+        assert created is not None
+        if serialization != "production":
+            payload = json.loads(created["path"].read_text(encoding="utf-8"))
+            payload[metadata_key] = {"ignored": "unicode metadata value 🧪"}
+            created["path"].write_text(
+                json.dumps(payload, ensure_ascii=serialization == "escaped"),
+                encoding="utf-8",
+            )
+        loaded = load_externalized_payload(
+            created["path"].name,
+            config=engine._config,
+            hermes_home=engine._hermes_home,
+        )
+        assert loaded is not None
+        assert loaded["session_id"] == session_id
+        assert loaded["content"] == original
+        assert (
+            restore_ingest_payload_placeholders(
+                created["placeholder"],
+                config=engine._config,
+                session_id=session_id,
+            )
+            == original
+        )
+        _append(
+            engine,
+            role="user",
+            content=created["placeholder"],
+            session_id=session_id,
+        )
+
+        result = periodic.run_periodic_backup(
+            periodic.build_periodic_backup_spec(engine), due_only=False
+        )
+        assert result["status"] == "ok", result
+        restored_config = SimpleNamespace(
+            large_output_externalization_path=str(
+                Path(result["generation"]) / "payloads"
+            )
+        )
+        restored = load_externalized_payload(
+            created["path"].name,
+            config=restored_config,
+        )
+        assert restored is not None
+        assert restored["session_id"] == session_id
+        assert restored["content"] == original
+        assert (
+            restore_ingest_payload_placeholders(
+                created["placeholder"],
+                config=restored_config,
+                session_id=session_id,
+            )
+            == original
+        )
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        b'"session_id": "\xff"',
+        b'"session_id": "\\u12xz"',
+    ],
+    ids=["invalid-utf8", "invalid-unicode-escape"],
+)
+def test_malformed_unicode_metadata_is_rejected_without_publication(
+    tmp_path, replacement
+):
+    engine = _engine(tmp_path)
+    try:
+        created = externalize_ingest_payload(
+            "recover this payload",
+            role="user",
+            session_id="session",
+            field_path="content",
+            config=engine._config,
+            hermes_home=engine._hermes_home,
+        )
+        assert created is not None
+        original = created["path"].read_bytes()
+        mutated = original.replace(b'"session_id": "session"', replacement, 1)
+        assert mutated != original
+        created["path"].write_bytes(mutated)
+        _append(engine, role="user", content=created["placeholder"])
+
+        spec = periodic.build_periodic_backup_spec(engine)
+        result = periodic.run_periodic_backup(spec, due_only=False)
+        assert result["status"] == "failed"
+        assert "valid JSON" in result["error"]
+        assert not (spec.namespace / "latest-good.json").exists()
     finally:
         engine.shutdown()
 

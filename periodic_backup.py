@@ -39,7 +39,6 @@ import uuid
 from .externalize import (
     _StreamingJSONReader,
     _stream_json_read_number,
-    _stream_json_read_string,
     _stream_json_skip_value,
     _stream_json_skip_whitespace,
     get_large_output_storage_dir,
@@ -769,6 +768,53 @@ def _read_json_hex_escape(reader: _BoundedPayloadJSONReader) -> int:
     return int(raw.decode("ascii"), 16)
 
 
+def _stream_payload_json_read_string(
+    reader: _BoundedPayloadJSONReader,
+    *,
+    capture_limit: int,
+) -> str | None:
+    """Read one bounded JSON string without mixing byte and character offsets."""
+    if reader.read() != ord('"'):
+        raise ValueError("invalid_json_string")
+    raw = bytearray()
+    truncated = False
+    escaped = False
+    unicode_digits_remaining = 0
+    decoder = codecs.getincrementaldecoder("utf-8")("strict")
+    while True:
+        byte = reader.read()
+        if byte is None:
+            raise ValueError("truncated_json_string")
+        if unicode_digits_remaining:
+            if byte not in b"0123456789abcdefABCDEF":
+                raise ValueError("invalid_json_unicode_escape")
+            unicode_digits_remaining -= 1
+        elif escaped:
+            if byte == ord("u"):
+                unicode_digits_remaining = 4
+            elif byte not in b'"\\/bfnrt':
+                raise ValueError("invalid_json_escape")
+            escaped = False
+        elif byte == ord("\\"):
+            escaped = True
+        elif byte == ord('"'):
+            decoder.decode(b"", final=True)
+            if truncated:
+                return None
+            source = (b'"' + bytes(raw) + b'"').decode("utf-8")
+            value, end = json.JSONDecoder().raw_decode(source)
+            if end != len(source) or not isinstance(value, str):
+                raise ValueError("invalid_json_string")
+            return value
+        elif byte < 0x20:
+            raise ValueError("invalid_json_control_character")
+        decoder.decode(bytes((byte,)), final=False)
+        if len(raw) < capture_limit:
+            raw.append(byte)
+        else:
+            truncated = True
+
+
 def _stream_json_content_metrics(
     reader: _BoundedPayloadJSONReader,
 ) -> tuple[int, int]:
@@ -856,7 +902,7 @@ def _stream_payload_document(
             reader.read()
         else:
             while True:
-                key = _stream_json_read_string(reader, capture_limit=256)
+                key = _stream_payload_json_read_string(reader, capture_limit=256)
                 _stream_json_skip_whitespace(reader)
                 if reader.read() != ord(":"):
                     raise ValueError("invalid_payload_object")
@@ -869,7 +915,7 @@ def _stream_payload_document(
                         content_metrics = _stream_json_content_metrics(reader)
                 elif key in captured_strings:
                     if reader.peek() == ord('"'):
-                        value = _stream_json_read_string(
+                        value = _stream_payload_json_read_string(
                             reader,
                             capture_limit=_MAX_METADATA_BYTES,
                         )
