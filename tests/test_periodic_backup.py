@@ -1577,6 +1577,281 @@ def test_scheduler_reaps_dead_timed_out_worker_and_reregistration_race(
         first.shutdown()
 
 
+def test_large_inventory_manifest_is_verified_and_failed_successor_preserves_last_good(
+    tmp_path,
+):
+    payload_root = tmp_path / "payloads"
+    payload_root.mkdir()
+    payload_bytes = json.dumps(
+        {
+            "kind": "tool_result",
+            "tool_call_id": "call-1",
+            "session_id": "session",
+            "content": "x",
+            "content_chars": 1,
+            "content_bytes": 1,
+        }
+    ).encode("utf-8")
+    engine = _engine(tmp_path, payload_root=payload_root, keep_last=1)
+    try:
+        suffix = "x" * 220
+        for index in range(12_000):
+            ref = f"p{index:05d}-{suffix}.json"
+            (payload_root / ref).write_bytes(payload_bytes)
+            engine._store.append(
+                "session",
+                {
+                    "role": "tool",
+                    "content": _placeholder(ref),
+                    "timestamp": time.time(),
+                },
+            )
+        engine._store.commit()
+
+        spec = periodic.build_periodic_backup_spec(engine)
+        good = periodic.run_periodic_backup(spec, due_only=False)
+        assert good["status"] == "ok", good
+        generation = Path(good["generation"])
+        manifest_path = generation / "manifest.json"
+        assert manifest_path.stat().st_size > periodic._MAX_METADATA_BYTES
+        verified = periodic._read_verified_pointer(spec)
+        assert verified is not None and verified[0] == generation
+
+        pointer_path = spec.namespace / "latest-good.json"
+        pointer_before = pointer_path.read_bytes()
+        generations_before = _generation_dirs(spec)
+        _append(engine, content=_placeholder("missing-successor.json"))
+        failed = periodic.run_periodic_backup(spec, due_only=False)
+
+        assert failed["status"] == "failed"
+        assert pointer_path.read_bytes() == pointer_before
+        assert _generation_dirs(spec) == generations_before
+        recovered = periodic._read_verified_pointer(spec)
+        assert recovered is not None and recovered[0] == generation
+    finally:
+        engine.shutdown()
+
+
+def test_manifest_inventory_bound_does_not_unbound_other_metadata(tmp_path):
+    engine = _engine(tmp_path)
+    try:
+        spec = periodic.build_periodic_backup_spec(engine)
+        result = periodic.run_periodic_backup(spec, due_only=False)
+        assert result["status"] == "ok", result
+        manifest_path = Path(result["generation"]) / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["unmanifested_padding"] = "x" * periodic._MAX_METADATA_BYTES
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        assert manifest_path.stat().st_size > periodic._MAX_METADATA_BYTES
+
+        with pytest.raises(periodic.PeriodicBackupError, match="size is unsafe"):
+            periodic._read_verified_pointer(spec)
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize("mode", ["regular", "dangling_symlink", "directory", "fifo"])
+def test_reverification_rejects_every_unmanifested_payload_entry_and_preserves_last_good(
+    tmp_path,
+    mode,
+):
+    engine = _engine(tmp_path, keep_last=1)
+    try:
+        spec = periodic.build_periodic_backup_spec(engine)
+        good = periodic.run_periodic_backup(spec, due_only=False)
+        assert good["status"] == "ok", good
+        generation = Path(good["generation"])
+        pointer_path = spec.namespace / "latest-good.json"
+        pointer_before = pointer_path.read_bytes()
+        generations_before = _generation_dirs(spec)
+        extra = generation / "payloads" / "unmanifested"
+        if mode == "regular":
+            extra.write_text("unmanifested", encoding="utf-8")
+        elif mode == "dangling_symlink":
+            extra.symlink_to(tmp_path / "does-not-exist")
+        elif mode == "directory":
+            extra.mkdir()
+        else:
+            os.mkfifo(extra)
+
+        with pytest.raises(periodic.PeriodicBackupError):
+            periodic._read_verified_pointer(spec)
+        failed = periodic.run_periodic_backup(spec, due_only=False)
+        assert failed["status"] == "failed"
+        assert pointer_path.read_bytes() == pointer_before
+        assert _generation_dirs(spec) == generations_before
+
+        if mode == "directory":
+            extra.rmdir()
+        else:
+            extra.unlink()
+        recovered = periodic._read_verified_pointer(spec)
+        assert recovered is not None and recovered[0] == generation
+    finally:
+        engine.shutdown()
+
+
+def test_configured_database_rebind_after_default_timeout_registers_only_latest_profile_spec(
+    monkeypatch,
+    tmp_path,
+):
+    real_run = periodic.run_periodic_backup
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked_run(*_args, cancel=None, **_kwargs):
+        assert cancel is not None
+        entered.set()
+        assert release.wait(20)
+        return {"ok": False, "status": "cancelled" if cancel.is_set() else "failed"}
+
+    monkeypatch.setattr(periodic, "run_periodic_backup", blocked_run)
+    home_a = tmp_path / "profile-a"
+    home_b = tmp_path / "profile-b"
+    home_c = tmp_path / "profile-c"
+    engine = LCMEngine(
+        config=LCMConfig(
+            database_path=str(tmp_path / "shared-lcm.db"),
+            periodic_backup_enabled=True,
+            periodic_backup_interval_hours=6.0,
+            periodic_backup_keep_last=2,
+        ),
+        hermes_home=str(home_a),
+    )
+    key = str(periodic.build_periodic_backup_spec(engine).source_db)
+    old = periodic._SCHEDULERS[key]
+    try:
+        assert entered.wait(5)
+        assert periodic._SCHEDULER_SHUTDOWN_TIMEOUT_SECONDS == 10.0
+        rebind_started = time.monotonic()
+        assert engine._rebind_storage_for_home(str(home_b)) is True
+        assert time.monotonic() - rebind_started >= 9.5
+        spec_b = periodic.build_periodic_backup_spec(engine)
+        assert engine._periodic_backup_registration.active is True
+        assert periodic._SCHEDULERS[key] is old
+        assert old.thread.is_alive() and old.cancel.is_set()
+
+        assert engine._rebind_storage_for_home(str(home_c)) is True
+        spec_c = periodic.build_periodic_backup_spec(engine)
+        assert spec_b != spec_c
+        assert engine._periodic_backup_registration.active is True
+        assert periodic._SCHEDULERS[key] is old
+        assert len(
+            [
+                thread
+                for thread in threading.enumerate()
+                if thread.name.startswith("lcm-periodic-backup-")
+            ]
+        ) == 1
+
+        monkeypatch.setattr(periodic, "run_periodic_backup", real_run)
+        release.set()
+        _wait_for(lambda: periodic._SCHEDULERS.get(key) is not old)
+        successor = periodic._SCHEDULERS[key]
+        assert not old.thread.is_alive()
+        assert successor.spec == spec_c
+        assert engine._periodic_backup_registration.owner in successor.owners
+        assert len(successor.owners) == 1
+        _wait_for(lambda: (spec_c.namespace / "latest-good.json").exists())
+        assert not (spec_b.namespace / "latest-good.json").exists()
+        assert len(
+            [
+                thread
+                for thread in threading.enumerate()
+                if thread.name.startswith("lcm-periodic-backup-")
+            ]
+        ) == 1
+    finally:
+        release.set()
+        engine.shutdown()
+        with periodic._REGISTRY_LOCK:
+            leftover = periodic._SCHEDULERS.pop(key, None)
+        if leftover is not None and leftover.thread.is_alive():
+            leftover.stop()
+
+
+def test_timed_out_scheduler_handoff_serializes_concurrent_owners_and_cancellation(
+    monkeypatch,
+    tmp_path,
+):
+    real_run = periodic.run_periodic_backup
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked_run(*_args, cancel=None, **_kwargs):
+        assert cancel is not None
+        entered.set()
+        assert release.wait(5)
+        return {"ok": False, "status": "cancelled" if cancel.is_set() else "failed"}
+
+    monkeypatch.setattr(periodic, "run_periodic_backup", blocked_run)
+    monkeypatch.setattr(periodic, "_SCHEDULER_SHUTDOWN_TIMEOUT_SECONDS", 0.05)
+    first = _engine(tmp_path, enabled=True)
+    second = _engine(tmp_path, enabled=False)
+    third = _engine(tmp_path, enabled=False)
+    key = str(periodic.build_periodic_backup_spec(first).source_db)
+    old = periodic._SCHEDULERS[key]
+    registrations = []
+    try:
+        assert entered.wait(5)
+        assert periodic.unregister_periodic_backup(first._periodic_backup_registration) is False
+        second._config.periodic_backup_enabled = True
+        third._config.periodic_backup_enabled = True
+        barrier = threading.Barrier(3)
+
+        def register(engine):
+            barrier.wait()
+            registrations.append(periodic.register_periodic_backup_successor(engine))
+
+        workers = [
+            threading.Thread(target=register, args=(candidate,))
+            for candidate in (second, third)
+        ]
+        for worker in workers:
+            worker.start()
+        barrier.wait()
+        for worker in workers:
+            worker.join(5)
+            assert not worker.is_alive()
+
+        assert len(registrations) == 2
+        assert all(registration.active for registration in registrations)
+        assert periodic._SCHEDULERS[key] is old
+        assert len(
+            [
+                thread
+                for thread in threading.enumerate()
+                if thread.name.startswith("lcm-periodic-backup-")
+            ]
+        ) == 1
+
+        cancelled, retained = registrations
+        second._periodic_backup_registration = cancelled
+        third._periodic_backup_registration = retained
+        assert periodic.unregister_periodic_backup(cancelled) is True
+        second._periodic_backup_registration = None
+
+        monkeypatch.setattr(periodic, "run_periodic_backup", real_run)
+        release.set()
+        _wait_for(lambda: periodic._SCHEDULERS.get(key) is not old)
+        successor = periodic._SCHEDULERS[key]
+        assert not old.thread.is_alive()
+        assert successor.owners == {retained.owner}
+        assert cancelled.owner not in successor.owners
+        _wait_for(
+            lambda: (periodic.build_periodic_backup_spec(third).namespace / "latest-good.json").exists()
+        )
+    finally:
+        release.set()
+        third.shutdown()
+        second.shutdown()
+        first.shutdown()
+        with periodic._REGISTRY_LOCK:
+            leftover = periodic._SCHEDULERS.pop(key, None)
+        if leftover is not None and leftover.thread.is_alive():
+            leftover.stop()
+
+
 def test_dead_owned_staging_is_cleaned_but_active_and_foreign_paths_are_retained(
     tmp_path,
 ):

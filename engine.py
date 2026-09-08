@@ -126,6 +126,7 @@ from .aux_session import AuxiliarySessionMixin
 from .placeholder_ledger import PlaceholderLedgerMixin
 from .periodic_backup import (
     register_periodic_backup,
+    register_periodic_backup_successor,
     unregister_periodic_backup,
 )
 from .reconcile import ReconcileMixin, _PRESERVED_OBJECTIVE_CONTEXT_PREFIX
@@ -845,7 +846,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             if store is not None:
                 store._hermes_home = hermes_home
             self._reset_profile_runtime_state()
-            self._periodic_backup_registration = register_periodic_backup(self)
+            self._periodic_backup_registration = register_periodic_backup_successor(self)
             logger.info("LCM rebound Hermes home for configured database path %s", hermes_home)
             return True
 

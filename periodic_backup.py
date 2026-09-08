@@ -56,6 +56,10 @@ _STAGING_SCHEMA = "lcm-periodic-backup-staging/v1"
 _BACKUP_BUSY_TIMEOUT_SECONDS = 5.0
 _BACKUP_MAX_SECONDS = 300.0
 _MAX_METADATA_BYTES = 4 * 1024 * 1024
+# Each generated payload record has three fixed keys, one bounded filesystem
+# basename, one platform file-size integer, and one SHA-256 digest.  Manifest
+# allowance grows only with the safe entries actually present in the bundle.
+_MANIFEST_PAYLOAD_ENTRY_OVERHEAD_BYTES = 256
 _SCHEDULER_SHUTDOWN_TIMEOUT_SECONDS = 10.0
 _MAX_FAILURE_BACKOFF_SECONDS = 300.0
 _INGEST_MARKER_RE = re.compile(
@@ -322,7 +326,12 @@ def _write_json_exclusive(path: Path, value: dict[str, Any]) -> None:
         os.close(fd)
 
 
-def _read_json_regular(path: Path) -> dict[str, Any]:
+def _read_json_regular(
+    path: Path,
+    *,
+    max_bytes: int = _MAX_METADATA_BYTES,
+    cancel: threading.Event | None = None,
+) -> dict[str, Any]:
     expected = os.lstat(path)
     if stat.S_ISLNK(expected.st_mode) or not stat.S_ISREG(expected.st_mode):
         raise PeriodicBackupError(f"metadata is not a regular file: {path}")
@@ -333,12 +342,17 @@ def _read_json_regular(path: Path) -> dict[str, Any]:
         if (
             not stat.S_ISREG(opened.st_mode)
             or (opened.st_dev, opened.st_ino) != (expected.st_dev, expected.st_ino)
-            or opened.st_size > _MAX_METADATA_BYTES
+            or opened.st_size > max_bytes
         ):
             raise PeriodicBackupError(f"metadata identity or size is unsafe: {path}")
         raw = bytearray()
-        while len(raw) <= _MAX_METADATA_BYTES:
-            chunk = os.read(fd, min(1024 * 1024, _MAX_METADATA_BYTES + 1 - len(raw)))
+        deadline = time.monotonic() + _BACKUP_MAX_SECONDS
+        while len(raw) <= max_bytes:
+            if cancel is not None and cancel.is_set():
+                raise PeriodicBackupCancelled("periodic backup cancelled during metadata read")
+            if time.monotonic() >= deadline:
+                raise PeriodicBackupError("metadata read exceeded its bounded deadline")
+            chunk = os.read(fd, min(1024 * 1024, max_bytes + 1 - len(raw)))
             if not chunk:
                 break
             raw.extend(chunk)
@@ -347,7 +361,7 @@ def _read_json_regular(path: Path) -> dict[str, Any]:
             (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino)
             or current.st_size != opened.st_size
             or current.st_mtime_ns != opened.st_mtime_ns
-            or len(raw) > _MAX_METADATA_BYTES
+            or len(raw) > max_bytes
         ):
             raise PeriodicBackupError(f"metadata changed during read: {path}")
         value = json.loads(bytes(raw).decode("utf-8"))
@@ -1076,15 +1090,91 @@ def _generation_manifest(
     spec: PeriodicBackupSpec,
     generation: Path,
     *,
+    payload_names: set[str],
     expected_generation_id: str | None = None,
+    cancel: threading.Event | None = None,
 ) -> dict[str, Any]:
-    manifest = _read_json_regular(generation / "manifest.json")
+    try:
+        payload_name_bytes = sum(
+            len(json.dumps(name, ensure_ascii=False).encode("utf-8"))
+            for name in payload_names
+        )
+    except UnicodeEncodeError as exc:
+        raise PeriodicBackupError("generation payload basename is not valid UTF-8") from exc
+    manifest_limit = (
+        _MAX_METADATA_BYTES
+        + payload_name_bytes
+        + len(payload_names) * _MANIFEST_PAYLOAD_ENTRY_OVERHEAD_BYTES
+    )
+    manifest = _read_json_regular(
+        generation / "manifest.json",
+        max_bytes=manifest_limit,
+        cancel=cancel,
+    )
     expected_id = expected_generation_id or generation.name
     if manifest.get("schema") != BUNDLE_SCHEMA or manifest.get("generation_id") != expected_id:
         raise PeriodicBackupError("generation manifest schema or id mismatch")
     if not _identity_matches(manifest.get("source_identity"), spec):
         raise PeriodicBackupError("generation source identity mismatch")
     return manifest
+
+
+def _safe_payload_entry_names(
+    payload_dir: Path,
+    *,
+    cancel: threading.Event | None,
+) -> set[str]:
+    expected = os.lstat(payload_dir)
+    if stat.S_ISLNK(expected.st_mode) or not stat.S_ISDIR(expected.st_mode):
+        raise PeriodicBackupError("generation payload directory is unsafe")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(payload_dir, flags)
+    try:
+        opened = os.fstat(fd)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or (opened.st_dev, opened.st_ino) != (expected.st_dev, expected.st_ino)
+        ):
+            raise PeriodicBackupError("generation payload directory changed during open")
+        names: set[str] = set()
+        deadline = time.monotonic() + _BACKUP_MAX_SECONDS
+        with os.scandir(fd) as entries:
+            for entry in entries:
+                if cancel is not None and cancel.is_set():
+                    raise PeriodicBackupCancelled(
+                        "periodic backup cancelled during payload enumeration"
+                    )
+                if time.monotonic() >= deadline:
+                    raise PeriodicBackupError(
+                        "generation payload enumeration exceeded its bounded deadline"
+                    )
+                observed = entry.stat(follow_symlinks=False)
+                if (
+                    stat.S_ISLNK(observed.st_mode)
+                    or not stat.S_ISREG(observed.st_mode)
+                    or getattr(observed, "st_nlink", 1) != 1
+                    or not _owned_regular_file(observed)
+                ):
+                    raise PeriodicBackupError(
+                        f"generation payload entry is unsafe: {entry.name}"
+                    )
+                if entry.name in names:
+                    raise PeriodicBackupError(
+                        f"generation payload entry is duplicated: {entry.name}"
+                    )
+                names.add(entry.name)
+        after = os.fstat(fd)
+        current = os.lstat(payload_dir)
+        if (
+            (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino)
+            or after.st_mtime_ns != opened.st_mtime_ns
+            or (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino)
+            or current.st_mtime_ns != opened.st_mtime_ns
+        ):
+            raise PeriodicBackupError("generation payload directory changed during enumeration")
+        return names
+    finally:
+        os.close(fd)
 
 
 def _verify_generation(
@@ -1100,10 +1190,14 @@ def _verify_generation(
         raise PeriodicBackupError("generation is not a plain directory")
     if generation.resolve(strict=True).parent != namespace:
         raise PeriodicBackupError("generation escaped its source namespace")
+    payload_dir = generation / "payloads"
+    actual = _safe_payload_entry_names(payload_dir, cancel=cancel)
     manifest = _generation_manifest(
         spec,
         generation,
+        payload_names=actual,
         expected_generation_id=expected_generation_id,
+        cancel=cancel,
     )
     database = manifest.get("database")
     payloads = manifest.get("payloads")
@@ -1114,10 +1208,6 @@ def _verify_generation(
     if database != {"basename": "lcm.sqlite3", "size": size, "sha256": digest, "integrity_check": "ok"}:
         raise PeriodicBackupError("generation SQLite metadata mismatch")
     _integrity_check(db_path, cancel=cancel)
-    payload_dir = generation / "payloads"
-    observed_payload_dir = os.lstat(payload_dir)
-    if stat.S_ISLNK(observed_payload_dir.st_mode) or not stat.S_ISDIR(observed_payload_dir.st_mode):
-        raise PeriodicBackupError("generation payload directory is unsafe")
     seen: set[str] = set()
     for entry in payloads:
         if not isinstance(entry, dict):
@@ -1133,11 +1223,6 @@ def _verify_generation(
         item_size, item_digest = _sha256_file(payload_path, cancel=cancel)
         if entry != {"basename": name, "size": item_size, "sha256": item_digest}:
             raise PeriodicBackupError(f"generation payload metadata mismatch: {name}")
-    actual = {
-        child.name
-        for child in payload_dir.iterdir()
-        if child.is_file() and not child.is_symlink()
-    }
     if actual != seen:
         raise PeriodicBackupError("generation payload set does not match manifest")
     references = _enumerate_recovery_refs(db_path, cancel=cancel)
@@ -1706,6 +1791,9 @@ class _Scheduler:
     def __init__(self, spec: PeriodicBackupSpec):
         self.spec = spec
         self.owners: set[object] = set()
+        self.pending_spec: PeriodicBackupSpec | None = None
+        self.pending_owners: set[object] = set()
+        self.handoff_thread: threading.Thread | None = None
         self.cancel = threading.Event()
         self.condition = threading.Condition()
         self.thread = threading.Thread(
@@ -1806,8 +1894,52 @@ _REGISTRY_LOCK = threading.RLock()
 _SCHEDULERS: dict[str, _Scheduler] = {}
 
 
-def register_periodic_backup(engine) -> PeriodicBackupRegistration:
-    """Reference-count one process-local scheduler for an enabled engine."""
+def _promote_stopped_scheduler(key: str, scheduler: _Scheduler) -> _Scheduler | None:
+    if scheduler.thread.is_alive():
+        return scheduler
+    if not scheduler.pending_owners or scheduler.pending_spec is None:
+        if _SCHEDULERS.get(key) is scheduler:
+            _SCHEDULERS.pop(key)
+        return None
+    successor = _Scheduler(scheduler.pending_spec)
+    successor.owners.update(scheduler.pending_owners)
+    _SCHEDULERS[key] = successor
+    return successor
+
+
+def _complete_scheduler_handoff(key: str, scheduler: _Scheduler) -> None:
+    scheduler.thread.join()
+    with _REGISTRY_LOCK:
+        if _SCHEDULERS.get(key) is scheduler:
+            _promote_stopped_scheduler(key, scheduler)
+
+
+def _queue_scheduler_handoff(
+    key: str,
+    scheduler: _Scheduler,
+    spec: PeriodicBackupSpec,
+    owner: object,
+) -> str:
+    if scheduler.pending_spec is not None and scheduler.pending_spec != spec:
+        return "conflicting pending periodic backup registration for canonical database"
+    scheduler.pending_spec = spec
+    scheduler.pending_owners.add(owner)
+    if scheduler.handoff_thread is None or not scheduler.handoff_thread.is_alive():
+        scheduler.handoff_thread = threading.Thread(
+            target=_complete_scheduler_handoff,
+            args=(key, scheduler),
+            name=f"lcm-backup-handoff-{spec.source_identity[:12]}",
+            daemon=True,
+        )
+        scheduler.handoff_thread.start()
+    return ""
+
+
+def _register_periodic_backup(
+    engine,
+    *,
+    allow_shutdown_handoff: bool,
+) -> PeriodicBackupRegistration:
     owner = object()
     if not bool(getattr(engine._config, "periodic_backup_enabled", False)):
         return PeriodicBackupRegistration("", owner, False)
@@ -1821,12 +1953,16 @@ def register_periodic_backup(engine) -> PeriodicBackupRegistration:
         scheduler = _SCHEDULERS.get(key)
         if scheduler is not None and scheduler.cancel.is_set():
             if scheduler.thread.is_alive():
+                if allow_shutdown_handoff:
+                    error = _queue_scheduler_handoff(key, scheduler, spec, owner)
+                    if not error:
+                        return PeriodicBackupRegistration(key, owner, True)
+                    logger.warning("LCM %s %s", error, spec.source_db)
+                    return PeriodicBackupRegistration(key, owner, False, error)
                 error = "previous periodic backup worker is still shutting down"
                 logger.warning("LCM %s for %s", error, spec.source_db)
                 return PeriodicBackupRegistration(key, owner, False, error)
-            if _SCHEDULERS.get(key) is scheduler:
-                _SCHEDULERS.pop(key)
-            scheduler = None
+            scheduler = _promote_stopped_scheduler(key, scheduler)
         if scheduler is not None and scheduler.spec != spec:
             error = "conflicting periodic backup registration for canonical database"
             logger.warning("LCM %s %s", error, spec.source_db)
@@ -1838,13 +1974,30 @@ def register_periodic_backup(engine) -> PeriodicBackupRegistration:
     return PeriodicBackupRegistration(key, owner, True)
 
 
+def register_periodic_backup(engine) -> PeriodicBackupRegistration:
+    """Reference-count one process-local scheduler for an enabled engine."""
+    return _register_periodic_backup(engine, allow_shutdown_handoff=False)
+
+
+def register_periodic_backup_successor(engine) -> PeriodicBackupRegistration:
+    """Register the current spec after an old same-source worker fully exits."""
+    return _register_periodic_backup(engine, allow_shutdown_handoff=True)
+
+
 def unregister_periodic_backup(registration: PeriodicBackupRegistration | None) -> bool:
     """Release an engine owner and stop the worker after the final owner exits."""
     if registration is None or not registration.active:
         return True
     with _REGISTRY_LOCK:
         current = _SCHEDULERS.get(registration.source_key)
-        if current is None or registration.owner not in current.owners:
+        if current is None:
+            return True
+        if registration.owner in current.pending_owners:
+            current.pending_owners.remove(registration.owner)
+            if not current.pending_owners:
+                current.pending_spec = None
+            return True
+        if registration.owner not in current.owners:
             return True
         current.owners.remove(registration.owner)
         if current.owners:
