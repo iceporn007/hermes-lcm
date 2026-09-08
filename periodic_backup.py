@@ -17,6 +17,7 @@ identity.
 
 from __future__ import annotations
 
+import codecs
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -31,20 +32,18 @@ import sqlite3
 import stat
 import threading
 import time
-from types import SimpleNamespace
 from typing import Any, Callable
 from urllib.parse import quote
 import uuid
 
 from .externalize import (
+    _StreamingJSONReader,
+    _stream_json_read_number,
+    _stream_json_read_string,
+    _stream_json_skip_value,
+    _stream_json_skip_whitespace,
     get_large_output_storage_dir,
-    load_externalized_payload,
 )
-from .ingest_protection import (
-    restore_ingest_payload_placeholders,
-)
-
-
 logger = logging.getLogger(__name__)
 
 BUNDLE_SCHEMA = "lcm-periodic-backup/v1"
@@ -53,9 +52,10 @@ SOURCE_IDENTITY_VERSION = 1
 _GENERATION_PREFIX = "lcm-periodic-"
 _LOCK_NAME = ".periodic-backup.lock"
 _POINTER_NAME = "latest-good.json"
+_STAGING_OWNER_NAME = ".owner.json"
+_STAGING_SCHEMA = "lcm-periodic-backup-staging/v1"
 _BACKUP_BUSY_TIMEOUT_SECONDS = 5.0
 _BACKUP_MAX_SECONDS = 300.0
-_MAX_PAYLOAD_BYTES = 64 * 1024 * 1024
 _MAX_METADATA_BYTES = 4 * 1024 * 1024
 _SCHEDULER_SHUTDOWN_TIMEOUT_SECONDS = 10.0
 _MAX_FAILURE_BACKOFF_SECONDS = 300.0
@@ -65,6 +65,10 @@ _INGEST_MARKER_RE = re.compile(
 _EXTERNALIZED_MARKER_RE = re.compile(
     r"\[(?:Externalized|GC'd externalized) (?:tool output|payload):.*?;\s*ref=(?P<ref>[^;\]\s]+)\]"
 )
+_STAGING_NAME_RE = re.compile(
+    r"^(?P<generation>lcm-periodic-\d{8}T\d{6}\.\d{6}Z-[0-9a-f]{12})\.partial$"
+)
+_QUARANTINED_ASSISTANT_KIND = "quarantined_assistant_output"
 _EXAMPLE_REF_PREFIXES = (
     "example-",
     "example_",
@@ -209,14 +213,24 @@ def _identity_matches(value: Any, spec: PeriodicBackupSpec) -> bool:
     return isinstance(value, dict) and value == _identity_payload(spec)
 
 
-def _private_directory(path: Path, *, parents: bool = False) -> None:
-    if parents:
-        path.mkdir(parents=True, mode=0o700, exist_ok=True)
-    else:
+def _owned_by_current_user(file_stat: os.stat_result) -> bool:
+    geteuid = getattr(os, "geteuid", None)
+    return geteuid is None or getattr(file_stat, "st_uid", None) in (None, geteuid())
+
+
+def _private_directory(path: Path, *, preserve_existing: bool = False) -> None:
+    existed = False
+    try:
         path.mkdir(mode=0o700)
+    except FileExistsError:
+        existed = True
     observed = os.lstat(path)
     if stat.S_ISLNK(observed.st_mode) or not stat.S_ISDIR(observed.st_mode):
         raise PeriodicBackupError(f"backup path is not a plain directory: {path}")
+    if existed and preserve_existing:
+        return
+    if existed and not _owned_by_current_user(observed):
+        raise PeriodicBackupError(f"existing backup path is not owned by this user: {path}")
     path.chmod(0o700)
 
 
@@ -233,7 +247,7 @@ def _prepare_private_directory_tree(path: Path) -> None:
     for component in reversed(missing):
         _private_directory(component)
         _fsync_directory(component.parent)
-    _private_directory(path, parents=True)
+    _private_directory(path, preserve_existing=True)
 
 
 def _prepare_namespace(spec: PeriodicBackupSpec) -> None:
@@ -242,7 +256,7 @@ def _prepare_namespace(spec: PeriodicBackupSpec) -> None:
     if spec.namespace.parent.resolve(strict=True) != expected_root:
         raise PeriodicBackupError("backup namespace escaped its configured root")
     namespace_existed = spec.namespace.exists()
-    _private_directory(spec.namespace, parents=True)
+    _private_directory(spec.namespace)
     if not namespace_existed:
         _fsync_directory(spec.destination_root)
     if spec.namespace.resolve(strict=True).parent != expected_root:
@@ -633,8 +647,7 @@ def _enumerate_recovery_refs(
 
 
 def _owned_regular_file(file_stat: os.stat_result) -> bool:
-    geteuid = getattr(os, "geteuid", None)
-    return geteuid is None or getattr(file_stat, "st_uid", None) in (None, geteuid())
+    return _owned_by_current_user(file_stat)
 
 
 def _copy_payload(
@@ -680,18 +693,19 @@ def _copy_payload(
         destination_fd = os.open(destination, destination_flags, 0o600)
         digest = hashlib.sha256()
         size = 0
-        raw = bytearray()
+        deadline = time.monotonic() + _BACKUP_MAX_SECONDS
         while True:
             if cancel is not None and cancel.is_set():
                 raise PeriodicBackupCancelled("periodic backup cancelled during payload copy")
+            if time.monotonic() >= deadline:
+                raise PeriodicBackupError(
+                    "externalized payload copy exceeded its bounded deadline"
+                )
             chunk = os.read(source_fd, 1024 * 1024)
             if not chunk:
                 break
             size += len(chunk)
-            if size > _MAX_PAYLOAD_BYTES:
-                raise PeriodicBackupError(f"referenced payload exceeds loader limit: {ref}")
             digest.update(chunk)
-            raw.extend(chunk)
             view = memoryview(chunk)
             while view:
                 written = os.write(destination_fd, view)
@@ -710,26 +724,6 @@ def _copy_payload(
             or size != opened.st_size
         ):
             raise PeriodicBackupError(f"referenced payload changed during copy: {ref}")
-        try:
-            decoded = json.loads(bytes(raw).decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise PeriodicBackupError(f"referenced payload is not valid JSON: {ref}") from exc
-        if not isinstance(decoded, dict) or not isinstance(decoded.get("content"), str):
-            raise PeriodicBackupError(f"referenced payload is not loader-compatible: {ref}")
-        content = decoded["content"]
-        for key, actual in (
-            ("content_chars", len(content)),
-            ("content_bytes", len(content.encode("utf-8"))),
-        ):
-            declared = decoded.get(key)
-            if declared is not None and (
-                isinstance(declared, bool)
-                or not isinstance(declared, int)
-                or declared != actual
-            ):
-                raise PeriodicBackupError(
-                    f"referenced payload {key} is invalid: {ref}"
-                )
         return {"basename": ref, "size": size, "sha256": digest.hexdigest()}
     except FileNotFoundError as exc:
         raise PeriodicBackupError(f"referenced payload is missing: {ref}") from exc
@@ -741,29 +735,205 @@ def _copy_payload(
         os.close(dir_fd)
 
 
-def _read_payload_document(payload_dir: Path, ref: str) -> dict[str, Any]:
+class _BoundedPayloadJSONReader(_StreamingJSONReader):
+    def __init__(
+        self,
+        handle,
+        *,
+        cancel: threading.Event | None,
+    ) -> None:
+        super().__init__(handle, start=0)
+        self._cancel = cancel
+        self._deadline = time.monotonic() + _BACKUP_MAX_SECONDS
+
+    def peek(self) -> int | None:
+        if self._index >= len(self._buffer):
+            if self._cancel is not None and self._cancel.is_set():
+                raise PeriodicBackupCancelled(
+                    "periodic backup cancelled during payload validation"
+                )
+            if time.monotonic() >= self._deadline:
+                raise PeriodicBackupError(
+                    "externalized payload validation exceeded its bounded deadline"
+                )
+        return super().peek()
+
+
+def _read_json_hex_escape(reader: _BoundedPayloadJSONReader) -> int:
+    raw = bytearray()
+    for _ in range(4):
+        byte = reader.read()
+        if byte is None or byte not in b"0123456789abcdefABCDEF":
+            raise ValueError("invalid_json_unicode_escape")
+        raw.append(byte)
+    return int(raw.decode("ascii"), 16)
+
+
+def _stream_json_content_metrics(
+    reader: _BoundedPayloadJSONReader,
+) -> tuple[int, int]:
+    if reader.read() != ord('"'):
+        raise ValueError("payload_content_is_not_string")
+    decoder = codecs.getincrementaldecoder("utf-8")("strict")
+    content_chars = 0
+    content_bytes = 0
+    simple_escapes = {
+        ord('"'): '"',
+        ord("\\"): "\\",
+        ord("/"): "/",
+        ord("b"): "\b",
+        ord("f"): "\f",
+        ord("n"): "\n",
+        ord("r"): "\r",
+        ord("t"): "\t",
+    }
+    while True:
+        if reader.peek() is None:
+            raise ValueError("truncated_json_string")
+        start = reader._index
+        quote_at = reader._buffer.find(b'"', start)
+        escape_at = reader._buffer.find(b"\\", start)
+        special_positions = [
+            position for position in (quote_at, escape_at) if position >= 0
+        ]
+        special_at = min(special_positions) if special_positions else len(reader._buffer)
+        raw = reader._buffer[start:special_at]
+        if raw:
+            if min(raw) < 0x20:
+                raise ValueError("invalid_json_control_character")
+            decoded = decoder.decode(raw, final=False)
+            content_chars += len(decoded)
+            content_bytes += len(raw)
+            reader._index = special_at
+        if special_at >= len(reader._buffer):
+            continue
+
+        byte = reader.read()
+        if byte == ord('"'):
+            final = decoder.decode(b"", final=True)
+            content_chars += len(final)
+            return content_chars, content_bytes
+        final = decoder.decode(b"", final=True)
+        content_chars += len(final)
+        decoder = codecs.getincrementaldecoder("utf-8")("strict")
+        escaped = reader.read()
+        if escaped == ord("u"):
+            codepoint = _read_json_hex_escape(reader)
+            if 0xD800 <= codepoint <= 0xDBFF:
+                if reader.read() != ord("\\") or reader.read() != ord("u"):
+                    raise ValueError("invalid_json_surrogate_pair")
+                low = _read_json_hex_escape(reader)
+                if not 0xDC00 <= low <= 0xDFFF:
+                    raise ValueError("invalid_json_surrogate_pair")
+                codepoint = 0x10000 + ((codepoint - 0xD800) << 10) + (low - 0xDC00)
+            elif 0xDC00 <= codepoint <= 0xDFFF:
+                raise ValueError("invalid_json_surrogate_pair")
+            value = chr(codepoint)
+        else:
+            value = simple_escapes.get(escaped)
+            if value is None:
+                raise ValueError("invalid_json_escape")
+        content_chars += 1
+        content_bytes += len(value.encode("utf-8"))
+
+
+def _stream_payload_document(
+    path: Path,
+    *,
+    cancel: threading.Event | None,
+) -> dict[str, Any]:
+    captured_strings = {"kind", "tool_call_id", "role", "session_id", "field_path"}
+    captured_numbers = {"content_chars", "content_bytes", "created_at"}
+    decoded: dict[str, Any] = {}
+    content_metrics: tuple[int, int] | None = None
+    with path.open("rb") as handle:
+        reader = _BoundedPayloadJSONReader(handle, cancel=cancel)
+        _stream_json_skip_whitespace(reader)
+        if reader.read() != ord("{"):
+            raise ValueError("payload_is_not_json_object")
+        _stream_json_skip_whitespace(reader)
+        if reader.peek() == ord("}"):
+            reader.read()
+        else:
+            while True:
+                key = _stream_json_read_string(reader, capture_limit=256)
+                _stream_json_skip_whitespace(reader)
+                if reader.read() != ord(":"):
+                    raise ValueError("invalid_payload_object")
+                _stream_json_skip_whitespace(reader)
+                if key == "content":
+                    if reader.peek() != ord('"'):
+                        _stream_json_skip_value(reader, depth=1)
+                        content_metrics = None
+                    else:
+                        content_metrics = _stream_json_content_metrics(reader)
+                elif key in captured_strings:
+                    if reader.peek() == ord('"'):
+                        value = _stream_json_read_string(
+                            reader,
+                            capture_limit=_MAX_METADATA_BYTES,
+                        )
+                        decoded[key] = value if value is not None else object()
+                    else:
+                        value_type = reader.peek()
+                        _stream_json_skip_value(reader, depth=1)
+                        decoded[key] = None if value_type == ord("n") else object()
+                elif key in captured_numbers:
+                    if reader.peek() in (ord("-"), *range(ord("0"), ord("9") + 1)):
+                        raw_number = _stream_json_read_number(reader)
+                        decoded[key] = (
+                            json.loads(raw_number) if raw_number is not None else object()
+                        )
+                    else:
+                        value_type = reader.peek()
+                        _stream_json_skip_value(reader, depth=1)
+                        decoded[key] = None if value_type == ord("n") else object()
+                else:
+                    _stream_json_skip_value(reader, depth=1)
+                _stream_json_skip_whitespace(reader)
+                separator = reader.read()
+                if separator == ord("}"):
+                    break
+                if separator != ord(","):
+                    raise ValueError("invalid_payload_object")
+                _stream_json_skip_whitespace(reader)
+        _stream_json_skip_whitespace(reader)
+        if reader.peek() is not None:
+            raise ValueError("trailing_payload_data")
+    if content_metrics is None:
+        raise ValueError("payload_content_is_not_string")
+    decoded["_actual_content_chars"] = content_metrics[0]
+    decoded["_actual_content_bytes"] = content_metrics[1]
+    return decoded
+
+
+def _read_payload_document(
+    payload_dir: Path,
+    ref: str,
+    *,
+    cancel: threading.Event | None,
+) -> dict[str, Any]:
     try:
-        decoded = json.loads((payload_dir / ref).read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        decoded = _stream_payload_document(payload_dir / ref, cancel=cancel)
+    except PeriodicBackupCancelled:
+        raise
+    except PeriodicBackupError:
+        raise
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
         raise PeriodicBackupError(f"copied payload is not valid JSON: {ref}") from exc
-    if not isinstance(decoded, dict):
-        raise PeriodicBackupError(f"copied payload is not a JSON object: {ref}")
-    content = decoded.get("content")
-    if not isinstance(content, str):
-        raise PeriodicBackupError(f"copied payload content is not text: {ref}")
     for key in ("kind", "tool_call_id", "role", "session_id", "field_path"):
         value = decoded.get(key)
         if value is not None and not isinstance(value, str):
             raise PeriodicBackupError(f"copied payload {key} is not text: {ref}")
-    for key, actual in (
-        ("content_chars", len(content)),
-        ("content_bytes", len(content.encode("utf-8"))),
+    for key, actual_key in (
+        ("content_chars", "_actual_content_chars"),
+        ("content_bytes", "_actual_content_bytes"),
     ):
         declared = decoded.get(key)
         if declared is not None and (
             isinstance(declared, bool)
             or not isinstance(declared, int)
-            or declared != actual
+            or declared != decoded[actual_key]
         ):
             raise PeriodicBackupError(f"copied payload {key} is invalid: {ref}")
     created_at = decoded.get("created_at")
@@ -779,8 +949,10 @@ def _read_payload_document(payload_dir: Path, ref: str) -> dict[str, Any]:
 def _validate_payload_context(
     payload_dir: Path,
     reference: _RecoveryReference,
+    *,
+    cancel: threading.Event | None,
 ) -> None:
-    payload = _read_payload_document(payload_dir, reference.ref)
+    payload = _read_payload_document(payload_dir, reference.ref, cancel=cancel)
     payload_session = str(payload.get("session_id") or "")
     if payload_session and reference.session_id and payload_session != reference.session_id:
         raise PeriodicBackupError(
@@ -791,11 +963,10 @@ def _validate_payload_context(
         raise PeriodicBackupError(f"copied payload role mismatch: {reference.ref}")
 
     if reference.marker_type == "ingest":
-        if payload.get("kind") != "ingest_payload":
-            raise PeriodicBackupError(f"copied ingest payload kind mismatch: {reference.ref}")
         marker_kind = _marker_metadata(reference.marker, "kind")
-        if marker_kind and marker_kind != "ingest_payload":
-            raise PeriodicBackupError(f"ingest marker kind is unsupported: {reference.ref}")
+        payload_kind = str(payload.get("kind") or "")
+        if marker_kind != payload_kind:
+            raise PeriodicBackupError(f"copied ingest payload kind mismatch: {reference.ref}")
         marker_field = _marker_metadata(reference.marker, "field")
         payload_field = str(payload.get("field_path") or "")
         if marker_field and _placeholder_metadata_value(payload_field) != marker_field:
@@ -806,16 +977,25 @@ def _validate_payload_context(
             or payload_field.startswith(reference.field + "[")
         ):
             raise PeriodicBackupError(f"copied ingest payload field context mismatch: {reference.ref}")
-        config = SimpleNamespace(large_output_externalization_path=str(payload_dir))
-        restored = restore_ingest_payload_placeholders(
-            reference.marker,
-            config=config,
-            session_id=reference.session_id,
-        )
-        if restored == reference.marker:
-            raise PeriodicBackupError(
-                f"existing ingest recovery rejected copied payload: {reference.ref}"
-            )
+        if payload_kind == _QUARANTINED_ASSISTANT_KIND:
+            if payload_session != reference.session_id or not payload_session:
+                raise PeriodicBackupError(
+                    f"copied quarantined payload session identity mismatch: {reference.ref}"
+                )
+            if reference.role != "assistant" or payload_role != "assistant":
+                raise PeriodicBackupError(
+                    f"copied quarantined payload role mismatch: {reference.ref}"
+                )
+            if reference.field != "content" or payload_field != "content":
+                raise PeriodicBackupError(
+                    f"copied quarantined payload field context mismatch: {reference.ref}"
+                )
+            if "assistant output quarantined" not in reference.marker:
+                raise PeriodicBackupError(
+                    f"copied quarantined payload marker mismatch: {reference.ref}"
+                )
+        elif payload_kind != "ingest_payload":
+            raise PeriodicBackupError(f"ingest marker kind is unsupported: {reference.ref}")
     else:
         expected_kind = _marker_metadata(reference.marker, "kind")
         if not expected_kind and "tool output:" in reference.marker:
@@ -833,18 +1013,6 @@ def _validate_payload_context(
                 f"copied payload tool-call identity mismatch: {reference.ref}"
             )
 
-    config = SimpleNamespace(large_output_externalization_path=str(payload_dir))
-    try:
-        loaded = load_externalized_payload(reference.ref, config=config)
-    except Exception as exc:
-        raise PeriodicBackupError(
-            f"existing payload loader raised for copied payload: {reference.ref}"
-        ) from exc
-    if loaded is None or loaded.get("content") != payload["content"]:
-        raise PeriodicBackupError(
-            f"existing payload loader rejected copied payload: {reference.ref}"
-        )
-
 
 def _verify_payload_recovery(
     payload_dir: Path,
@@ -855,7 +1023,7 @@ def _verify_payload_recovery(
     for reference in references:
         if cancel is not None and cancel.is_set():
             raise PeriodicBackupCancelled("periodic backup cancelled during loader verification")
-        _validate_payload_context(payload_dir, reference)
+        _validate_payload_context(payload_dir, reference, cancel=cancel)
 
 
 def _generation_manifest(
@@ -1051,6 +1219,147 @@ def _cleanup_partial(path: Path) -> None:
         logger.warning("LCM periodic backup could not clean partial generation %s", path, exc_info=True)
 
 
+def _process_is_alive(pid: Any) -> bool:
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return True
+    if pid == os.getpid():
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        return True
+    return True
+
+
+def _owned_plain_regular(path: Path) -> bool:
+    try:
+        observed = os.lstat(path)
+    except OSError:
+        return False
+    return (
+        stat.S_ISREG(observed.st_mode)
+        and not stat.S_ISLNK(observed.st_mode)
+        and getattr(observed, "st_nlink", 1) == 1
+        and _owned_by_current_user(observed)
+    )
+
+
+def _owned_staging_tree(path: Path) -> bool:
+    try:
+        observed = os.lstat(path)
+        if (
+            stat.S_ISLNK(observed.st_mode)
+            or not stat.S_ISDIR(observed.st_mode)
+            or not _owned_by_current_user(observed)
+        ):
+            return False
+        entries = list(path.iterdir())
+    except OSError:
+        return False
+
+    allowed_files = {
+        _STAGING_OWNER_NAME,
+        "lcm.sqlite3",
+        "lcm.sqlite3-journal",
+        "lcm.sqlite3-shm",
+        "lcm.sqlite3-wal",
+        "manifest.json",
+    }
+    for entry in entries:
+        if entry.name == "payloads":
+            try:
+                payload_stat = os.lstat(entry)
+                if (
+                    stat.S_ISLNK(payload_stat.st_mode)
+                    or not stat.S_ISDIR(payload_stat.st_mode)
+                    or not _owned_by_current_user(payload_stat)
+                ):
+                    return False
+                payload_entries = list(entry.iterdir())
+            except OSError:
+                return False
+            if any(
+                payload.name != Path(payload.name).name
+                or not payload.name.endswith(".json")
+                or not _owned_plain_regular(payload)
+                for payload in payload_entries
+            ):
+                return False
+        elif entry.name not in allowed_files or not _owned_plain_regular(entry):
+            return False
+    return True
+
+
+def _staging_has_owned_proof(
+    spec: PeriodicBackupSpec,
+    path: Path,
+    generation_id: str,
+) -> bool:
+    owner_path = path / _STAGING_OWNER_NAME
+    try:
+        os.lstat(owner_path)
+    except FileNotFoundError:
+        owner = None
+    except OSError:
+        return False
+    else:
+        try:
+            owner = _read_json_regular(owner_path)
+        except (OSError, PeriodicBackupError):
+            return False
+        if not (
+            owner.get("schema") == _STAGING_SCHEMA
+            and owner.get("generation_id") == generation_id
+            and _identity_matches(owner.get("source_identity"), spec)
+        ):
+            return False
+        if _process_is_alive(owner.get("creator_pid")):
+            return False
+        return True
+
+    try:
+        manifest = _read_json_regular(path / "manifest.json")
+    except (OSError, PeriodicBackupError):
+        return False
+    return (
+        manifest.get("schema") == BUNDLE_SCHEMA
+        and manifest.get("generation_id") == generation_id
+        and _identity_matches(manifest.get("source_identity"), spec)
+    )
+
+
+def _cleanup_abandoned_staging(spec: PeriodicBackupSpec) -> list[str]:
+    if not getattr(shutil.rmtree, "avoids_symlink_attacks", False):
+        return []
+    deleted: list[str] = []
+    for candidate in spec.namespace.iterdir():
+        match = _STAGING_NAME_RE.fullmatch(candidate.name)
+        if match is None:
+            continue
+        try:
+            expected = os.lstat(candidate)
+            if not _owned_staging_tree(candidate):
+                continue
+            generation_id = match.group("generation")
+            if not _staging_has_owned_proof(spec, candidate, generation_id):
+                continue
+            current = os.lstat(candidate)
+            if (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino):
+                continue
+            shutil.rmtree(candidate)
+            _fsync_directory(spec.namespace)
+            deleted.append(candidate.name)
+        except OSError:
+            logger.warning(
+                "LCM periodic backup could not clean abandoned staging %s",
+                candidate,
+                exc_info=True,
+            )
+    return deleted
+
+
 def _call_fault(fault: FaultHook | None, stage: str) -> None:
     if fault is not None:
         fault(stage)
@@ -1179,6 +1488,7 @@ def run_periodic_backup(
             verified = None
             if (spec.namespace / _POINTER_NAME).exists():
                 verified = _read_verified_pointer(spec, cancel=cancel)
+            _cleanup_abandoned_staging(spec)
             current_generation_id = verified[0].name if verified is not None else None
             due_in = _seconds_from_verified_pointer(spec, verified, now=started)
             force_monotonic_due = (
@@ -1199,6 +1509,17 @@ def run_periodic_backup(
             partial = spec.namespace / f"{generation_id}.partial"
             final = spec.namespace / generation_id
             _private_directory(partial)
+            _write_json_exclusive(
+                partial / _STAGING_OWNER_NAME,
+                {
+                    "schema": _STAGING_SCHEMA,
+                    "source_identity": _identity_payload(spec),
+                    "generation_id": generation_id,
+                    "creator_pid": os.getpid(),
+                },
+            )
+            _fsync_directory(partial)
+            _fsync_directory(spec.namespace)
             payload_dir = partial / "payloads"
             _private_directory(payload_dir)
 
@@ -1258,6 +1579,8 @@ def run_periodic_backup(
                 cancel=cancel,
             )
 
+            (partial / _STAGING_OWNER_NAME).unlink()
+            _fsync_directory(partial)
             _call_fault(_fault, "final_rename")
             os.rename(partial, final)
             partial = None
@@ -1451,9 +1774,13 @@ def register_periodic_backup(engine) -> PeriodicBackupRegistration:
     with _REGISTRY_LOCK:
         scheduler = _SCHEDULERS.get(key)
         if scheduler is not None and scheduler.cancel.is_set():
-            error = "previous periodic backup worker is still shutting down"
-            logger.warning("LCM %s for %s", error, spec.source_db)
-            return PeriodicBackupRegistration(key, owner, False, error)
+            if scheduler.thread.is_alive():
+                error = "previous periodic backup worker is still shutting down"
+                logger.warning("LCM %s for %s", error, spec.source_db)
+                return PeriodicBackupRegistration(key, owner, False, error)
+            if _SCHEDULERS.get(key) is scheduler:
+                _SCHEDULERS.pop(key)
+            scheduler = None
         if scheduler is not None and scheduler.spec != spec:
             error = "conflicting periodic backup registration for canonical database"
             logger.warning("LCM %s %s", error, spec.source_db)

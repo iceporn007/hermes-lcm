@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import shutil
 import sqlite3
+import stat
 import threading
 import time
 from types import SimpleNamespace
@@ -20,6 +21,7 @@ from hermes_lcm.config import LCMConfig
 from hermes_lcm.engine import LCMEngine
 from hermes_lcm.externalize import externalize_ingest_payload, load_externalized_payload
 from hermes_lcm.ingest_protection import (
+    _externalize_quarantined_assistant_output,
     extract_all_externalized_payload_refs,
     extract_ingest_externalized_refs,
     is_externalized_ingest_placeholder,
@@ -113,6 +115,14 @@ def _run_holding_backup(spec, acquired, release, result_queue) -> None:
                 raise RuntimeError("test lock release timed out")
 
     result_queue.put(periodic.run_periodic_backup(spec, due_only=False, _fault=fault))
+
+
+def _run_crashing_staged_backup(spec) -> None:
+    def fault(stage: str) -> None:
+        if stage == "stage_fsync":
+            os._exit(17)
+
+    periodic.run_periodic_backup(spec, due_only=False, _fault=fault)
 
 
 def test_periodic_config_defaults_env_and_strict_validation(monkeypatch, tmp_path):
@@ -1167,4 +1177,344 @@ def test_unsupported_locking_fails_closed_without_publication(monkeypatch, tmp_p
         assert _generation_dirs(spec) == []
         assert not (spec.namespace / "latest-good.json").exists()
     finally:
+        engine.shutdown()
+
+
+def test_production_quarantined_assistant_ref_survives_disposable_recovery(tmp_path):
+    engine = _engine(tmp_path)
+    try:
+        original = ("broken repetitive assistant output " * 4096).strip()
+        marker = _externalize_quarantined_assistant_output(
+            original,
+            role="assistant",
+            session_id="session",
+            config=engine._config,
+            hermes_home=engine._hermes_home,
+            reason="high_repetition",
+        )
+        assert marker is not None
+        refs = extract_ingest_externalized_refs(marker)
+        assert len(refs) == 1
+        loaded = load_externalized_payload(
+            refs[0], config=engine._config, hermes_home=engine._hermes_home
+        )
+        assert loaded is not None
+        assert loaded["kind"] == "quarantined_assistant_output"
+        assert loaded["role"] == "assistant"
+        assert loaded["session_id"] == "session"
+        assert loaded["field_path"] == "content"
+        assert loaded["content"] == original
+        _append(engine, role="assistant", content=marker)
+
+        result = periodic.run_periodic_backup(
+            periodic.build_periodic_backup_spec(engine), due_only=False
+        )
+        assert result["status"] == "ok", result
+        restored = tmp_path / "disposable-quarantine-restore"
+        shutil.copytree(Path(result["generation"]), restored)
+        restored_payload = load_externalized_payload(
+            refs[0],
+            config=SimpleNamespace(
+                large_output_externalization_path=str(restored / "payloads")
+            ),
+        )
+        assert restored_payload is not None
+        assert restored_payload["content"] == original
+        assert restored_payload["kind"] == "quarantined_assistant_output"
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_error"),
+    [
+        ({"session_id": "wrong-session"}, "session identity"),
+        ({"session_id": ""}, "session identity"),
+        ({"role": "user"}, "role mismatch"),
+        ({"role": ""}, "role mismatch"),
+        ({"kind": "ingest_payload"}, "kind mismatch"),
+        ({"field_path": "tool_calls[0]"}, "field"),
+        ({"field_path": ""}, "field"),
+    ],
+)
+def test_quarantined_assistant_payload_identity_mismatch_is_rejected(
+    tmp_path, mutation, expected_error
+):
+    engine = _engine(tmp_path)
+    try:
+        marker = _externalize_quarantined_assistant_output(
+            "repetitive output " * 4096,
+            role="assistant",
+            session_id="session",
+            config=engine._config,
+            hermes_home=engine._hermes_home,
+            reason="high_repetition",
+        )
+        assert marker is not None
+        ref = extract_ingest_externalized_refs(marker)[0]
+        path = Path(engine._config.large_output_externalization_path) / ref
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload.update(mutation)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        _append(engine, role="assistant", content=marker)
+
+        result = periodic.run_periodic_backup(
+            periodic.build_periodic_backup_spec(engine), due_only=False
+        )
+        assert result["status"] == "failed"
+        assert expected_error in result["error"]
+    finally:
+        engine.shutdown()
+
+
+def test_production_payload_above_64_mib_survives_backup_boundary(monkeypatch, tmp_path):
+    engine = _engine(tmp_path)
+    try:
+        original = "x" * (64 * 1024 * 1024 + 1)
+        created = externalize_ingest_payload(
+            original,
+            role="user",
+            session_id="session",
+            field_path="content",
+            config=engine._config,
+            hermes_home=engine._hermes_home,
+        )
+        assert created is not None
+        assert created["path"].stat().st_size > 64 * 1024 * 1024
+        loaded = load_externalized_payload(
+            created["path"].name,
+            config=engine._config,
+            hermes_home=engine._hermes_home,
+        )
+        assert loaded is not None and loaded["content"] == original
+        _append(engine, role="user", content=created["placeholder"])
+
+        real_json_loads = periodic.json.loads
+
+        def bounded_json_loads(value, *args, **kwargs):
+            if isinstance(value, (bytes, bytearray, str)):
+                assert len(value) <= periodic._MAX_METADATA_BYTES
+            return real_json_loads(value, *args, **kwargs)
+
+        with monkeypatch.context() as isolated:
+            isolated.setattr(periodic.json, "loads", bounded_json_loads)
+            result = periodic.run_periodic_backup(
+                periodic.build_periodic_backup_spec(engine), due_only=False
+            )
+        assert result["status"] == "ok", result
+        copied = Path(result["generation"]) / "payloads" / created["path"].name
+        assert copied.stat().st_size == created["path"].stat().st_size
+        restored = load_externalized_payload(
+            copied.name,
+            config=SimpleNamespace(
+                large_output_externalization_path=str(copied.parent)
+            ),
+        )
+        assert restored is not None and restored["content"] == original
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize("cut", [1, 17, 101])
+def test_truncated_production_payload_is_rejected_without_publication(tmp_path, cut):
+    engine = _engine(tmp_path)
+    try:
+        created = externalize_ingest_payload(
+            "recover this payload",
+            role="user",
+            session_id="session",
+            field_path="content",
+            config=engine._config,
+            hermes_home=engine._hermes_home,
+        )
+        assert created is not None
+        raw = created["path"].read_bytes()
+        created["path"].write_bytes(raw[:-cut])
+        _append(engine, role="user", content=created["placeholder"])
+
+        spec = periodic.build_periodic_backup_spec(engine)
+        result = periodic.run_periodic_backup(spec, due_only=False)
+        assert result["status"] == "failed"
+        assert "valid JSON" in result["error"]
+        assert not (spec.namespace / "latest-good.json").exists()
+    finally:
+        engine.shutdown()
+
+
+def test_destination_root_permissions_are_preserved_and_new_namespace_is_private(
+    tmp_path,
+):
+    existing_root = tmp_path / "operator-shared"
+    existing_root.mkdir(mode=0o750)
+    existing_root.chmod(0o750)
+    engine = _engine(tmp_path / "existing", destination=existing_root)
+    new_engine = _engine(tmp_path / "new", destination=tmp_path / "new-root")
+    try:
+        existing_spec = periodic.build_periodic_backup_spec(engine)
+        assert periodic.run_periodic_backup(existing_spec, due_only=False)["status"] == "ok"
+        assert stat.S_IMODE(os.lstat(existing_root).st_mode) == 0o750
+        assert stat.S_IMODE(os.lstat(existing_spec.namespace).st_mode) == 0o700
+
+        new_spec = periodic.build_periodic_backup_spec(new_engine)
+        assert periodic.run_periodic_backup(new_spec, due_only=False)["status"] == "ok"
+        assert stat.S_IMODE(os.lstat(new_spec.destination_root).st_mode) == 0o700
+        assert stat.S_IMODE(os.lstat(new_spec.namespace).st_mode) == 0o700
+    finally:
+        new_engine.shutdown()
+        engine.shutdown()
+
+
+def test_existing_foreign_owned_namespace_is_rejected_without_chmod(
+    monkeypatch,
+    tmp_path,
+):
+    engine = _engine(tmp_path)
+    try:
+        spec = periodic.build_periodic_backup_spec(engine)
+        spec.destination_root.mkdir(parents=True, mode=0o750)
+        spec.namespace.mkdir(mode=0o750)
+        spec.namespace.chmod(0o750)
+        actual_uid = getattr(os, "geteuid", lambda: 0)()
+        monkeypatch.setattr(periodic.os, "geteuid", lambda: actual_uid + 1)
+
+        result = periodic.run_periodic_backup(spec, due_only=False)
+        assert result["status"] == "failed"
+        assert "not owned" in result["error"]
+        assert stat.S_IMODE(os.lstat(spec.namespace).st_mode) == 0o750
+    finally:
+        engine.shutdown()
+
+
+def test_scheduler_reaps_dead_timed_out_worker_and_reregistration_race(
+    monkeypatch,
+    tmp_path,
+):
+    real_run = periodic.run_periodic_backup
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked_run(*_args, cancel=None, **_kwargs):
+        assert cancel is not None
+        entered.set()
+        assert release.wait(5)
+        return {"ok": False, "status": "cancelled" if cancel.is_set() else "failed"}
+
+    monkeypatch.setattr(periodic, "run_periodic_backup", blocked_run)
+    monkeypatch.setattr(periodic, "_SCHEDULER_SHUTDOWN_TIMEOUT_SECONDS", 0.05)
+    first = _engine(tmp_path, enabled=True)
+    second = _engine(tmp_path, enabled=False)
+    third = _engine(tmp_path, enabled=False)
+    registrations = []
+    try:
+        assert entered.wait(5)
+        assert periodic.unregister_periodic_backup(first._periodic_backup_registration) is False
+        key = str(periodic.build_periodic_backup_spec(first).source_db)
+        old = periodic._SCHEDULERS[key]
+        assert old.cancel.is_set() and old.thread.is_alive()
+
+        second._config.periodic_backup_enabled = True
+        still_live = periodic.register_periodic_backup(second)
+        assert still_live.active is False
+        assert "still shutting down" in still_live.error
+
+        release.set()
+        old.thread.join(5)
+        assert not old.thread.is_alive()
+        monkeypatch.setattr(periodic, "run_periodic_backup", real_run)
+        third._config.periodic_backup_enabled = True
+        barrier = threading.Barrier(3)
+
+        def register(engine):
+            barrier.wait()
+            registrations.append(periodic.register_periodic_backup(engine))
+
+        workers = [
+            threading.Thread(target=register, args=(candidate,))
+            for candidate in (second, third)
+        ]
+        for worker in workers:
+            worker.start()
+        barrier.wait()
+        for worker in workers:
+            worker.join(5)
+            assert not worker.is_alive()
+
+        assert len(registrations) == 2
+        assert all(registration.active for registration in registrations)
+        assert periodic.active_periodic_backup_scheduler_count() == 1
+        second._periodic_backup_registration = registrations[0]
+        third._periodic_backup_registration = registrations[1]
+    finally:
+        release.set()
+        third.shutdown()
+        second.shutdown()
+        first.shutdown()
+
+
+def test_dead_owned_staging_is_cleaned_but_active_and_foreign_paths_are_retained(
+    tmp_path,
+):
+    engine = _engine(tmp_path)
+    sleeper = multiprocessing.get_context("fork").Process(target=time.sleep, args=(10,))
+    try:
+        spec = periodic.build_periodic_backup_spec(engine)
+        context = multiprocessing.get_context("fork")
+        child = context.Process(target=_run_crashing_staged_backup, args=(spec,))
+        child.start()
+        child.join(15)
+        assert child.exitcode == 17
+        abandoned = list(spec.namespace.glob("lcm-periodic-*.partial"))
+        assert len(abandoned) == 1
+        assert (abandoned[0] / "lcm.sqlite3").is_file()
+        assert (abandoned[0] / "manifest.json").is_file()
+
+        sleeper.start()
+        active_id = "lcm-periodic-20300102T030405.000000Z-aaaaaaaaaaaa"
+        active = spec.namespace / f"{active_id}.partial"
+        active.mkdir(mode=0o700)
+        (active / ".owner.json").write_text(
+            json.dumps(
+                {
+                    "schema": "lcm-periodic-backup-staging/v1",
+                    "source_identity": periodic._identity_payload(spec),
+                    "generation_id": active_id,
+                    "creator_pid": sleeper.pid,
+                }
+            ),
+            encoding="utf-8",
+        )
+        foreign_id = "lcm-periodic-20300102T030405.000000Z-bbbbbbbbbbbb"
+        foreign = spec.namespace / f"{foreign_id}.partial"
+        foreign.mkdir(mode=0o700)
+        (foreign / ".owner.json").write_text(
+            json.dumps(
+                {
+                    "schema": "lcm-periodic-backup-staging/v1",
+                    "source_identity": {
+                        "version": 1,
+                        "canonical_db_path": "/foreign",
+                        "sha256": "0" * 64,
+                    },
+                    "generation_id": foreign_id,
+                    "creator_pid": 99999999,
+                }
+            ),
+            encoding="utf-8",
+        )
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        symlink = spec.namespace / "lcm-periodic-20300102T030405.000000Z-cccccccccccc.partial"
+        symlink.symlink_to(outside, target_is_directory=True)
+
+        result = periodic.run_periodic_backup(spec, due_only=False)
+        assert result["status"] == "ok", result
+        assert not abandoned[0].exists()
+        assert active.exists()
+        assert foreign.exists()
+        assert symlink.is_symlink()
+        assert list(outside.iterdir()) == []
+    finally:
+        if sleeper.is_alive():
+            sleeper.terminate()
+        sleeper.join(5)
         engine.shutdown()
