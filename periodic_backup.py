@@ -138,6 +138,15 @@ class _RecoveryReference:
     field: str
 
 
+@dataclass(frozen=True)
+class _PayloadDirectoryInventory:
+    names: frozenset[str]
+    device: int
+    inode: int
+    mtime_ns: int
+    ctime_ns: int
+
+
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -1119,11 +1128,11 @@ def _generation_manifest(
     return manifest
 
 
-def _safe_payload_entry_names(
+def _safe_payload_inventory(
     payload_dir: Path,
     *,
     cancel: threading.Event | None,
-) -> set[str]:
+) -> _PayloadDirectoryInventory:
     expected = os.lstat(payload_dir)
     if stat.S_ISLNK(expected.st_mode) or not stat.S_ISDIR(expected.st_mode):
         raise PeriodicBackupError("generation payload directory is unsafe")
@@ -1168,11 +1177,19 @@ def _safe_payload_entry_names(
         if (
             (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino)
             or after.st_mtime_ns != opened.st_mtime_ns
+            or after.st_ctime_ns != opened.st_ctime_ns
             or (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino)
             or current.st_mtime_ns != opened.st_mtime_ns
+            or current.st_ctime_ns != opened.st_ctime_ns
         ):
             raise PeriodicBackupError("generation payload directory changed during enumeration")
-        return names
+        return _PayloadDirectoryInventory(
+            names=frozenset(names),
+            device=after.st_dev,
+            inode=after.st_ino,
+            mtime_ns=after.st_mtime_ns,
+            ctime_ns=after.st_ctime_ns,
+        )
     finally:
         os.close(fd)
 
@@ -1191,11 +1208,11 @@ def _verify_generation(
     if generation.resolve(strict=True).parent != namespace:
         raise PeriodicBackupError("generation escaped its source namespace")
     payload_dir = generation / "payloads"
-    actual = _safe_payload_entry_names(payload_dir, cancel=cancel)
+    initial_inventory = _safe_payload_inventory(payload_dir, cancel=cancel)
     manifest = _generation_manifest(
         spec,
         generation,
-        payload_names=actual,
+        payload_names=set(initial_inventory.names),
         expected_generation_id=expected_generation_id,
         cancel=cancel,
     )
@@ -1223,7 +1240,7 @@ def _verify_generation(
         item_size, item_digest = _sha256_file(payload_path, cancel=cancel)
         if entry != {"basename": name, "size": item_size, "sha256": item_digest}:
             raise PeriodicBackupError(f"generation payload metadata mismatch: {name}")
-    if actual != seen:
+    if initial_inventory.names != seen:
         raise PeriodicBackupError("generation payload set does not match manifest")
     references = _enumerate_recovery_refs(db_path, cancel=cancel)
     expected_refs = {reference.ref for reference in references}
@@ -1233,6 +1250,9 @@ def _verify_generation(
         )
     _verify_payload_recovery(payload_dir, references, cancel=cancel)
     _parse_utc(manifest.get("completed_at"))
+    final_inventory = _safe_payload_inventory(payload_dir, cancel=cancel)
+    if final_inventory != initial_inventory:
+        raise PeriodicBackupError("generation payload directory changed during verification")
     return manifest
 
 

@@ -71,6 +71,18 @@ def _payload(path: Path, content: str, **extra) -> None:
     path.chmod(0o600)
 
 
+def _add_unmanifested_entry(path: Path, mode: str, *, dangling_target: Path) -> None:
+    if mode == "regular":
+        path.write_text("unmanifested", encoding="utf-8")
+    elif mode == "dangling_symlink":
+        path.symlink_to(dangling_target)
+    elif mode == "directory":
+        path.mkdir()
+    else:
+        assert mode == "fifo"
+        os.mkfifo(path)
+
+
 def _placeholder(ref: str) -> str:
     return f"[Externalized tool output: tool_call_id=call-1; chars=7; bytes=7; ref={ref}]"
 
@@ -1665,14 +1677,11 @@ def test_reverification_rejects_every_unmanifested_payload_entry_and_preserves_l
         pointer_before = pointer_path.read_bytes()
         generations_before = _generation_dirs(spec)
         extra = generation / "payloads" / "unmanifested"
-        if mode == "regular":
-            extra.write_text("unmanifested", encoding="utf-8")
-        elif mode == "dangling_symlink":
-            extra.symlink_to(tmp_path / "does-not-exist")
-        elif mode == "directory":
-            extra.mkdir()
-        else:
-            os.mkfifo(extra)
+        _add_unmanifested_entry(
+            extra,
+            mode,
+            dangling_target=tmp_path / "does-not-exist",
+        )
 
         with pytest.raises(periodic.PeriodicBackupError):
             periodic._read_verified_pointer(spec)
@@ -1687,6 +1696,170 @@ def test_reverification_rejects_every_unmanifested_payload_entry_and_preserves_l
             extra.unlink()
         recovered = periodic._read_verified_pointer(spec)
         assert recovered is not None and recovered[0] == generation
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize("mode", ["regular", "dangling_symlink", "directory", "fifo"])
+def test_reverification_rejects_payload_entry_added_during_database_hash(
+    tmp_path,
+    monkeypatch,
+    mode,
+):
+    engine = _engine(tmp_path, keep_last=1)
+    try:
+        spec = periodic.build_periodic_backup_spec(engine)
+        good = periodic.run_periodic_backup(spec, due_only=False)
+        assert good["status"] == "ok", good
+        generation = Path(good["generation"])
+        pointer_path = spec.namespace / "latest-good.json"
+        pointer_before = pointer_path.read_bytes()
+        extra = generation / "payloads" / "injected-during-verification"
+        real_hash = periodic._sha256_file
+        injected = False
+
+        def hash_with_concurrent_add(path, **kwargs):
+            nonlocal injected
+            if Path(path) == generation / "lcm.sqlite3" and not injected:
+                injected = True
+                _add_unmanifested_entry(
+                    extra,
+                    mode,
+                    dangling_target=tmp_path / "does-not-exist",
+                )
+            return real_hash(path, **kwargs)
+
+        monkeypatch.setattr(periodic, "_sha256_file", hash_with_concurrent_add)
+        with pytest.raises(periodic.PeriodicBackupError):
+            periodic._read_verified_pointer(spec)
+        assert injected is True
+        assert pointer_path.read_bytes() == pointer_before
+
+        if mode == "directory":
+            extra.rmdir()
+        else:
+            extra.unlink()
+        verified = periodic._read_verified_pointer(spec)
+        assert verified is not None and verified[0] == generation
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize("mode", ["regular", "dangling_symlink", "directory", "fifo"])
+@pytest.mark.parametrize("phase", ["database_hash", "payload_recovery"])
+def test_successor_payload_entry_added_during_verification_preserves_last_good(
+    tmp_path,
+    monkeypatch,
+    mode,
+    phase,
+):
+    payload_root = tmp_path / "payloads"
+    _payload(payload_root / "payload.json", "payload")
+    engine = _engine(tmp_path, payload_root=payload_root, keep_last=1)
+    try:
+        _append(engine, content=_placeholder("payload.json"))
+        spec = periodic.build_periodic_backup_spec(engine)
+        good = periodic.run_periodic_backup(spec, due_only=False)
+        assert good["status"] == "ok", good
+        pointer_path = spec.namespace / "latest-good.json"
+        pointer_before = pointer_path.read_bytes()
+        generations_before = _generation_dirs(spec)
+        real_hash = periodic._sha256_file
+        real_validate = periodic._validate_payload_context
+        injected = False
+        retention_called = False
+
+        def add_during_verification(payload_dir: Path) -> None:
+            nonlocal injected
+            if (
+                injected
+                or not payload_dir.parent.name.endswith(".partial")
+                or not (payload_dir.parent / "manifest.json").exists()
+            ):
+                return
+            injected = True
+            _add_unmanifested_entry(
+                payload_dir / "injected-during-verification",
+                mode,
+                dangling_target=tmp_path / "does-not-exist",
+            )
+
+        def hash_with_concurrent_add(path, **kwargs):
+            path = Path(path)
+            if (
+                phase == "database_hash"
+                and path.name == "lcm.sqlite3"
+                and path.parent.name.endswith(".partial")
+            ):
+                add_during_verification(path.parent / "payloads")
+            return real_hash(path, **kwargs)
+
+        def validate_with_concurrent_add(payload_dir, reference, *, cancel):
+            if phase == "payload_recovery":
+                add_during_verification(payload_dir)
+            return real_validate(payload_dir, reference, cancel=cancel)
+
+        def observe_retention(stage: str) -> None:
+            nonlocal retention_called
+            if stage == "retention":
+                retention_called = True
+
+        monkeypatch.setattr(periodic, "_sha256_file", hash_with_concurrent_add)
+        monkeypatch.setattr(periodic, "_validate_payload_context", validate_with_concurrent_add)
+        failed = periodic.run_periodic_backup(
+            spec,
+            due_only=False,
+            _fault=observe_retention,
+        )
+
+        assert injected is True
+        assert failed["status"] == "failed", failed
+        assert failed["published"] is False
+        assert failed["pointer_renamed"] is False
+        assert retention_called is False
+        assert pointer_path.read_bytes() == pointer_before
+        assert _generation_dirs(spec) == generations_before
+        verified = periodic._read_verified_pointer(spec)
+        assert verified is not None and verified[0] == Path(good["generation"])
+    finally:
+        engine.shutdown()
+
+
+def test_reverification_rejects_payload_directory_replacement_during_database_hash(
+    tmp_path,
+    monkeypatch,
+):
+    engine = _engine(tmp_path)
+    try:
+        spec = periodic.build_periodic_backup_spec(engine)
+        good = periodic.run_periodic_backup(spec, due_only=False)
+        assert good["status"] == "ok", good
+        generation = Path(good["generation"])
+        payload_dir = generation / "payloads"
+        displaced = generation / "payloads-displaced"
+        pointer_path = spec.namespace / "latest-good.json"
+        pointer_before = pointer_path.read_bytes()
+        real_hash = periodic._sha256_file
+        replaced = False
+
+        def hash_with_directory_replacement(path, **kwargs):
+            nonlocal replaced
+            if Path(path) == generation / "lcm.sqlite3" and not replaced:
+                replaced = True
+                payload_dir.rename(displaced)
+                payload_dir.mkdir(mode=0o700)
+            return real_hash(path, **kwargs)
+
+        monkeypatch.setattr(periodic, "_sha256_file", hash_with_directory_replacement)
+        with pytest.raises(periodic.PeriodicBackupError):
+            periodic._read_verified_pointer(spec)
+        assert replaced is True
+        assert pointer_path.read_bytes() == pointer_before
+
+        payload_dir.rmdir()
+        displaced.rename(payload_dir)
+        verified = periodic._read_verified_pointer(spec)
+        assert verified is not None and verified[0] == generation
     finally:
         engine.shutdown()
 
