@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from config import LCMConfig
+from hermes_lcm.config import LCMConfig
 
 
 def test_config_yaml_reads_bounded_context_guardrails(monkeypatch, tmp_path: Path):
